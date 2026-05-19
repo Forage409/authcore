@@ -37,10 +37,10 @@ app.use('/api/abuse/report', cors({
   maxAge: 86400,
 }));
 
-// playground.miaogou.site 演示用 — 封禁自己 / 解除自己（只对 playground-* 演示账号生效）
+// playground.miaogou.site 演示用 — 封禁 / 解除 / webhook 演示（限定 playground-* 演示账号 + 临时 sink）
 app.use('/api/demo/*', cors({
   origin: '*',
-  allowMethods: ['POST', 'OPTIONS'],
+  allowMethods: ['GET', 'POST', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'X-API-Key'],
   maxAge: 86400,
 }));
@@ -3366,6 +3366,137 @@ app.get('/demo/oauth/userinfo', async (c) => {
   }
 });
 
+// ══════ Playground Webhook 演示（30 分钟临时 sink + HMAC 签名 + 真实 HTTP 投递） ══════
+// 设计：访客生成独立 sink_id；触发后网关后端真的 HTTP POST 到 /demo/webhook-sink/<id>，
+//   sink 端校验签名后存库，trigger 返回完整投递报告。让用户亲眼看到"真实 webhook 投递"
+const WEBHOOK_DEMO_SECRET_KEY = 'X-AuthCore-Signature';
+
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 初始化一个 30 分钟有效的 sink
+app.post('/api/demo/webhook/init', async (c) => {
+  if (await rateLimit(c, 'demo_wh_init', 60, 20)) return err(c, 'rate_limited', '过于频繁', 429);
+  const sinkId = crypto.randomUUID().replace(/-/g, '');
+  const secret = 'whsec_' + crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+  await c.env.DB.prepare(
+    `INSERT INTO demo_webhook_sinks (sink_id, secret, created_at, expires_at)
+     VALUES (?, ?, datetime('now', '+8 hours'), datetime('now', '+8 hours', '+30 minutes'))`
+  ).bind(sinkId, secret).run();
+  const sinkUrl = `${ISSUER}/demo/webhook-sink/${sinkId}`;
+  return c.json({ sink_id: sinkId, secret, sink_url: sinkUrl });
+});
+
+// 触发：构造 payload + HMAC 签名 + 真实 POST 到 sink + 等结果
+app.post('/api/demo/webhook/trigger', async (c) => {
+  if (await rateLimit(c, 'demo_wh_trigger', 60, 30)) return err(c, 'rate_limited', '触发过于频繁', 429);
+  const body = await c.req.json().catch(() => ({}));
+  const { sink_id, event_type, demo_email } = body;
+  if (!sink_id || !event_type) return err(c, 'missing_fields', 'sink_id 与 event_type 必填', 400);
+  const sink = await c.env.DB.prepare(
+    `SELECT secret FROM demo_webhook_sinks WHERE sink_id = ? AND expires_at > datetime('now', '+8 hours')`
+  ).bind(sink_id).first() as any;
+  if (!sink) return err(c, 'sink_not_found', 'sink 不存在或已过期（30 分钟有效）', 404);
+
+  // 构造 event payload（包含一些演示数据让用户看着像真的）
+  const ts = new Date().toISOString();
+  const eventId = 'evt_' + crypto.randomUUID().replace(/-/g, '');
+  const samplePayloads: Record<string, any> = {
+    'user.created': {
+      id: eventId, type: 'user.created', created_at: ts, app_id: 'demo_app',
+      data: { user_id: 'usr_' + crypto.randomUUID().slice(0,8), email: demo_email || 'playground-demo@example.com', username: 'demo_user', email_verified: false, signup_method: 'password' },
+    },
+    'user.banned': {
+      id: eventId, type: 'user.banned', created_at: ts, app_id: 'demo_app',
+      data: { user_id: 'usr_' + crypto.randomUUID().slice(0,8), email: demo_email || 'playground-demo@example.com', reason: '演示触发的封禁事件', banned_by: 'platform_owner' },
+    },
+    'oidc.token_issued': {
+      id: eventId, type: 'oidc.token_issued', created_at: ts, app_id: 'demo_app',
+      data: { user_id: 'usr_' + crypto.randomUUID().slice(0,8), client_id: 'demo_client', scope: 'openid email profile', token_use: 'access' },
+    },
+    'session.revoked': {
+      id: eventId, type: 'session.revoked', created_at: ts, app_id: 'demo_app',
+      data: { user_id: 'usr_' + crypto.randomUUID().slice(0,8), reason: 'manual_revocation', session_count: 1 },
+    },
+  };
+  const payload = samplePayloads[event_type];
+  if (!payload) return err(c, 'invalid_event_type', '未知事件类型', 400);
+  const payloadJson = JSON.stringify(payload);
+  // HMAC-SHA256 签名：sha256=<hex>
+  const signature = 'sha256=' + await hmacSha256Hex(sink.secret, payloadJson);
+  // 真实 HTTP POST 到 sink（自己的域名内）
+  const sinkUrl = `${ISSUER}/demo/webhook-sink/${sink_id}`;
+  const t0 = Date.now();
+  let deliveryStatus = 0;
+  let deliveryError: string | null = null;
+  try {
+    const r = await fetch(sinkUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        [WEBHOOK_DEMO_SECRET_KEY]: signature,
+        'X-AuthCore-Event': event_type,
+        'X-AuthCore-Event-Id': eventId,
+        'X-AuthCore-Delivery': crypto.randomUUID(),
+        'User-Agent': 'AuthCore-Webhook/1.0',
+      },
+      body: payloadJson,
+    });
+    deliveryStatus = r.status;
+  } catch (e: any) {
+    deliveryError = e?.message || 'network error';
+  }
+  return c.json({
+    event_id: eventId,
+    event_type,
+    sent_payload: payload,
+    sent_signature: signature,
+    sink_url: sinkUrl,
+    delivery_status: deliveryStatus,
+    delivery_error: deliveryError,
+    duration_ms: Date.now() - t0,
+  });
+});
+
+// Webhook 接收端：验签 + 存库（公开端点，任何人可以测试，但只对已登记的 sink_id 有效）
+app.post('/demo/webhook-sink/:sinkId', async (c) => {
+  const sinkId = c.req.param('sinkId');
+  const sink = await c.env.DB.prepare(
+    `SELECT secret FROM demo_webhook_sinks WHERE sink_id = ? AND expires_at > datetime('now', '+8 hours')`
+  ).bind(sinkId).first() as any;
+  if (!sink) return c.json({ error: 'sink_not_found' }, 404);
+  const rawBody = await c.req.text();
+  const sigHeader = c.req.header(WEBHOOK_DEMO_SECRET_KEY) || '';
+  const eventType = c.req.header('X-AuthCore-Event') || 'unknown';
+  // 验签：sha256=<hex>
+  const expected = 'sha256=' + await hmacSha256Hex(sink.secret, rawBody);
+  const valid = (sigHeader === expected) ? 1 : 0;
+  await c.env.DB.prepare(
+    `INSERT INTO demo_webhook_events (id, sink_id, event_type, payload, signature_header, signature_valid, received_at)
+     VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))`
+  ).bind(crypto.randomUUID(), sinkId, eventType, rawBody, sigHeader, valid).run();
+  return c.json({ received: true, signature_valid: !!valid });
+});
+
+// 拉取 sink 收到的事件列表（playground 用，确认 round-trip 真的发生）
+app.get('/api/demo/webhook/events/:sinkId', async (c) => {
+  const sinkId = c.req.param('sinkId');
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, event_type, payload, signature_header, signature_valid, received_at
+     FROM demo_webhook_events WHERE sink_id = ? ORDER BY received_at DESC LIMIT 20`
+  ).bind(sinkId).all();
+  return c.json({ events: results || [] });
+});
+
 app.post('/api/abuse/report', async (c) => {
   // 多维度限流（IP）+ 全局限流（防整体淹没）
   if (await rateLimit(c, 'abuse:ip:m', 60, 5)) return err(c, 'rate_limited', '举报太频繁，请稍后再试', 429);
@@ -3725,5 +3856,14 @@ export default {
   },
   async scheduled(_event: any, env: Env, ctx: any) {
     ctx.waitUntil(processScheduledDeletions(env));
+    // Playground 演示数据清理：30 分钟过期 sink + 1h 过期 demo OIDC code/session
+    ctx.waitUntil((async () => {
+      try {
+        await env.DB.prepare(`DELETE FROM demo_webhook_events WHERE sink_id IN (SELECT sink_id FROM demo_webhook_sinks WHERE expires_at <= datetime('now', '+8 hours'))`).run();
+        await env.DB.prepare(`DELETE FROM demo_webhook_sinks WHERE expires_at <= datetime('now', '+8 hours')`).run();
+        await env.DB.prepare(`DELETE FROM demo_oidc_codes WHERE expires_at <= datetime('now', '+8 hours')`).run();
+        await env.DB.prepare(`DELETE FROM demo_oidc_sessions WHERE expires_at <= datetime('now', '+8 hours')`).run();
+      } catch (e) { console.error('[demo cleanup]', e); }
+    })());
   },
 };
