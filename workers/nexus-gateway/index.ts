@@ -45,6 +45,16 @@ app.use('/api/demo/*', cors({
   maxAge: 86400,
 }));
 
+// Playground 演示 OIDC：与生产 OIDC 完全隔离的平行端点集
+// 生产 /oauth/* 永远拒绝 playground-* 邮箱，而这里 /demo/oauth/* 只接受 playground-* 邮箱
+// 公开访问（无 SSO Cookie），但要求 client_id 必须等于 env.PLAYGROUND_DEMO_CLIENT_ID
+app.use('/demo/oauth/*', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400,
+}));
+
 // 控制台 API + 授权页内部接口 — 严格同源（带 SSO Cookie）
 app.use('/api/*', cors({
   origin: (origin) => {
@@ -3172,6 +3182,187 @@ app.post('/api/demo/unban-me', async (c) => {
   await c.env.DB.prepare(`UPDATE users SET banned = 0, banned_at = NULL, banned_reason = NULL WHERE email = ?`).bind(email).run();
   await c.env.DB.prepare(`UPDATE oidc_identities SET banned = 0, banned_at = NULL, banned_reason = NULL WHERE email = ?`).bind(email).run();
   return c.json({ success: true });
+});
+
+// ══════ Playground 演示 OIDC（与生产 OIDC 完全独立） ══════
+// 设计原则：
+//   - 自带认证流程：用 demo email/password 直接换 token（绕过 SSO Cookie 机制）
+//   - 强制 client_id == env.PLAYGROUND_DEMO_CLIENT_ID，否则全部拒绝
+//   - 共享生产 JWKS 签名（演示出来的 id_token 真实可被外部用 /oauth/jwks 验签）
+//   - 数据存 demo_oidc_codes / demo_oidc_sessions，60s 短寿命，cron 自动清理
+
+function demoClientId(c: any): string {
+  return String(c.env.PLAYGROUND_DEMO_CLIENT_ID || '').toLowerCase();
+}
+function isDemoClientId(c: any, clientId: string): boolean {
+  const expected = demoClientId(c);
+  return !!expected && expected === String(clientId || '').toLowerCase();
+}
+
+// 1. GET /demo/oauth/authorize/info — 给 DemoAuthorize.vue 拉应用信息 + 验证 client_id
+app.get('/demo/oauth/authorize/info', async (c) => {
+  const clientId = c.req.query('client_id') || '';
+  const redirectUri = c.req.query('redirect_uri') || '';
+  if (!isDemoClientId(c, clientId)) {
+    return err(c, 'invalid_client', '此端点仅限 Playground Demo App 使用', 400);
+  }
+  const app = await c.env.DB.prepare(
+    'SELECT id, name, app_logo, app_homepage, redirect_uris FROM api_keys WHERE id = ? AND revoked = 0'
+  ).bind(clientId).first() as any;
+  if (!app) return err(c, 'invalid_client', '应用不存在或已撤销', 400);
+  // redirect_uri 必须在已登记的 redirect_uris 里（演示同样走严格校验）
+  const allowed = String(app.redirect_uris || '').split(/[\n,]+/).map((s: string) => s.trim()).filter(Boolean);
+  if (!allowed.includes(redirectUri)) {
+    return err(c, 'invalid_redirect_uri', `redirect_uri 不在白名单内: ${redirectUri}`, 400);
+  }
+  return c.json({
+    app: { id: app.id, name: app.name, logo: app.app_logo, homepage: app.app_homepage },
+    demo: true,
+  });
+});
+
+// 2. POST /demo/oauth/authorize/consent — 验证 demo 凭证 + 发 code + 返回 redirect
+app.post('/demo/oauth/authorize/consent', async (c) => {
+  if (await rateLimit(c, 'demo_oidc_consent', 60, 20)) return err(c, 'rate_limited', '操作过于频繁', 429);
+  const body = await c.req.json().catch(() => ({}));
+  const { email, password, client_id, redirect_uri, scope, state, nonce, code_challenge, code_challenge_method, action } = body;
+  if (!isDemoClientId(c, client_id)) {
+    return err(c, 'invalid_client', '此端点仅限 Playground Demo App 使用', 400);
+  }
+  if (action === 'deny') {
+    const sep = redirect_uri.includes('?') ? '&' : '?';
+    return c.json({ redirect: `${redirect_uri}${sep}error=access_denied${state ? '&state=' + encodeURIComponent(state) : ''}` });
+  }
+  if (!isPlaygroundDemoEmail(email)) {
+    return err(c, 'invalid_grant', '此端点仅接受 playground 演示账号邮箱', 400);
+  }
+  if (!password) return err(c, 'invalid_grant', '密码必填', 400);
+  // 验证 demo redirect_uri 是否在白名单里
+  const app = await c.env.DB.prepare(
+    'SELECT redirect_uris FROM api_keys WHERE id = ? AND revoked = 0'
+  ).bind(client_id).first() as any;
+  if (!app) return err(c, 'invalid_client', '应用不存在', 400);
+  const allowed = String(app.redirect_uris || '').split(/[\n,]+/).map((s: string) => s.trim()).filter(Boolean);
+  if (!allowed.includes(redirect_uri)) return err(c, 'invalid_redirect_uri', 'redirect_uri 不在白名单', 400);
+  // 查 demo 用户（必须是同 tenant 即同一 api_key_id）
+  const demoUser = await c.env.DB.prepare(
+    `SELECT id, username, password_hash, salt, hash_version FROM users WHERE email = ? AND api_key_id = ?`
+  ).bind(email, client_id).first() as any;
+  if (!demoUser) return err(c, 'invalid_grant', '账号不存在或不属于此 demo 应用', 400);
+  let valid = false;
+  if (demoUser.hash_version === 1 && demoUser.salt) {
+    valid = await oidcPbkdf2Verify(password, demoUser.password_hash, demoUser.salt);
+  } else {
+    const sha = await sha256(password);
+    valid = (sha === demoUser.password_hash);
+  }
+  if (!valid) return err(c, 'invalid_grant', '密码错误', 401);
+  // 生成 code，存 60s
+  const code = 'demo_' + crypto.randomUUID() + crypto.randomUUID().replace(/-/g, '');
+  await c.env.DB.prepare(
+    `INSERT INTO demo_oidc_codes (code, client_id, redirect_uri, scope, code_challenge, code_challenge_method, nonce, state, demo_user_id, demo_email, demo_username, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+8 hours', '+60 seconds'))`
+  ).bind(
+    code, client_id, redirect_uri, scope || 'openid email profile',
+    code_challenge || null, code_challenge_method || null, nonce || null, state || null,
+    demoUser.id, email, demoUser.username || null
+  ).run();
+  const sep = redirect_uri.includes('?') ? '&' : '?';
+  return c.json({ redirect: `${redirect_uri}${sep}code=${encodeURIComponent(code)}${state ? '&state=' + encodeURIComponent(state) : ''}` });
+});
+
+// 3. POST /demo/oauth/token — 用 code + PKCE verifier 换 access_token / id_token
+app.post('/demo/oauth/token', async (c) => {
+  if (await rateLimit(c, 'demo_oidc_token', 60, 20)) return err(c, 'rate_limited', '操作过于频繁', 429);
+  const ctype = c.req.header('Content-Type') || '';
+  let params: any = {};
+  if (ctype.includes('application/x-www-form-urlencoded')) {
+    const text = await c.req.text();
+    params = Object.fromEntries(new URLSearchParams(text));
+  } else {
+    params = await c.req.json().catch(() => ({}));
+  }
+  const { grant_type, code, redirect_uri, client_id, code_verifier } = params;
+  if (grant_type !== 'authorization_code') return c.json({ error: 'unsupported_grant_type' }, 400);
+  if (!isDemoClientId(c, client_id)) return c.json({ error: 'invalid_client' }, 400);
+  const row = await c.env.DB.prepare(
+    `SELECT * FROM demo_oidc_codes WHERE code = ? AND used_at IS NULL AND expires_at > datetime('now', '+8 hours')`
+  ).bind(code || '').first() as any;
+  if (!row) return c.json({ error: 'invalid_grant', error_description: 'code 不存在 / 已用过 / 已过期（60s 寿命）' }, 400);
+  // 标 used，防重放
+  await c.env.DB.prepare(`UPDATE demo_oidc_codes SET used_at = datetime('now', '+8 hours') WHERE code = ?`).bind(code).run();
+  if (row.client_id !== client_id) return c.json({ error: 'invalid_client' }, 400);
+  if (row.redirect_uri !== redirect_uri) return c.json({ error: 'invalid_grant', error_description: 'redirect_uri 不匹配' }, 400);
+  // PKCE 校验（如果当初有的话）
+  if (row.code_challenge) {
+    if (!code_verifier) return c.json({ error: 'invalid_grant', error_description: '缺少 code_verifier' }, 400);
+    const expectedChallenge = row.code_challenge_method === 'S256'
+      ? await sha256B64u(code_verifier)
+      : code_verifier;
+    if (expectedChallenge !== row.code_challenge) {
+      return c.json({ error: 'invalid_grant', error_description: 'PKCE 校验失败' }, 400);
+    }
+  }
+  // 签发 access_token + id_token（用 RS256，与生产 OIDC 同一 signing key）
+  const sk = await getOrCreateActiveSigningKey(c.env.DB);
+  const now = Math.floor(Date.now() / 1000);
+  const scope = row.scope || 'openid email profile';
+  const sub = row.demo_user_id;
+  // ID Token：标记 demo:true 让接入方一眼看出是演示
+  const idClaims: any = {
+    iss: ISSUER, sub, aud: client_id, exp: now + ID_TOKEN_TTL_SEC, iat: now, auth_time: now, demo: true,
+  };
+  if (row.nonce) idClaims.nonce = row.nonce;
+  if (scope.includes('email')) { idClaims.email = row.demo_email; idClaims.email_verified = false; }
+  if (scope.includes('profile')) {
+    idClaims.name = row.demo_username || row.demo_email.split('@')[0];
+    idClaims.picture = ISSUER + '/avatar/demo.svg';
+  }
+  const idToken = await signRs256Jwt(idClaims, sk.kid, sk.key);
+  const accessClaims = { iss: ISSUER, sub, aud: client_id, scope, exp: now + ACCESS_TOKEN_TTL_SEC, iat: now, token_use: 'access', demo: true };
+  const accessToken = await signRs256Jwt(accessClaims, sk.kid, sk.key);
+  // 存 session 用于 userinfo 反查
+  const sessionId = crypto.randomUUID();
+  await c.env.DB.prepare(
+    `INSERT INTO demo_oidc_sessions (session_id, demo_user_id, demo_email, client_id, issued_at, expires_at)
+     VALUES (?, ?, ?, ?, datetime('now', '+8 hours'), datetime('now', '+8 hours', '+1 hour'))`
+  ).bind(sessionId, row.demo_user_id, row.demo_email, client_id).run();
+  return c.json({
+    access_token: accessToken,
+    token_type: 'Bearer',
+    expires_in: ACCESS_TOKEN_TTL_SEC,
+    id_token: idToken,
+    scope,
+    demo: true,
+  });
+});
+
+// 4. GET /demo/oauth/userinfo — 用 access_token 拉用户信息
+app.get('/demo/oauth/userinfo', async (c) => {
+  const auth = c.req.header('Authorization')?.replace(/^Bearer /, '');
+  if (!auth) return c.json({ error: 'invalid_token' }, 401);
+  try {
+    const pk = await getActivePublicKey(c.env.DB);
+    const payload: any = await verifyRs256(auth, pk.key);
+    if (payload.token_use !== 'access' || !payload.demo) {
+      return c.json({ error: 'invalid_token', error_description: '不是 demo access_token' }, 401);
+    }
+    // 查 users 表（demo tenant 隔离）
+    const u = await c.env.DB.prepare(
+      `SELECT id, email, username FROM users WHERE id = ? AND api_key_id = ?`
+    ).bind(payload.sub, payload.aud).first() as any;
+    if (!u) return c.json({ error: 'invalid_token', error_description: '演示账号已不存在（24h 后自动清理）' }, 401);
+    return c.json({
+      sub: u.id,
+      email: u.email,
+      email_verified: false,
+      name: u.username || u.email.split('@')[0],
+      picture: ISSUER + '/avatar/demo.svg',
+      demo: true,
+    });
+  } catch (e: any) {
+    return c.json({ error: 'invalid_token', error_description: e.message || 'token 验证失败' }, 401);
+  }
 });
 
 app.post('/api/abuse/report', async (c) => {

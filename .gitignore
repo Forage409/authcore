@@ -97,3 +97,6 @@ config.yml
 # 网关前端不开源
 /workers/nexus-gateway/frontend/
 
+# Playground 演示站（暂不开源，部署独立）
+/playground/
+
