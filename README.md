@@ -16,18 +16,6 @@
 
 ---
 
-## 截图
-
-<p align="center">
-  <img src=".github/screenshots/console.png" alt="开发者控制台" width="80%" />
-  <br/><em>开发者控制台 — API Key / OIDC 应用 / Webhook / 封禁管理</em>
-</p>
-
-<p align="center">
-  <img src=".github/screenshots/oidc-authorize.png" alt="OIDC 授权页" width="60%" />
-  <br/><em>Google 风格 OIDC 授权页</em>
-</p>
-
 ## 30 秒接入
 
 ```bash
@@ -38,13 +26,74 @@ cd my-app && npm install && npm run dev
 或者直接 SDK：
 
 ```ts
-import { AuthCore } from 'nexus-auth-sdk';
+import { AuthCore, AccountBannedError } from 'nexus-auth-sdk';
 
 const auth = new AuthCore({ apiKey: 'nx_xxx' });
 
-await auth.register({ email, password });           // 注册
-const { token, user } = await auth.login({ email, password });  // 登录
-const verified = await auth.verify(token);          // 校验
+// 注册（自动处理邮箱验证码 / captcha 等开关，前端无需写条件分支）
+await auth.register({ email, password });
+
+// 登录返回 JWT + Refresh Token
+const { token, refreshToken, user } = await auth.login({ email, password });
+
+// 校验任意 token（密码登录 + OIDC 自动二选一）
+const { valid, source } = await auth.verifyAny(token);   // source: 'jwt' | 'oidc'
+
+// 命名异常类——instanceof 判断免硬编码 error string
+try { await auth.login({ email, password }); }
+catch (e) {
+  if (e instanceof AccountBannedError) showBannedUI(e.reason);
+  else throw e;
+}
+```
+
+## 它是怎么运作的
+
+```
+   你的应用 (Browser)                                    AuthCore Gateway
+   ─────────────────                                    ─────────────────
+        │                                                       │
+        │  1. POST /auth/register { email, password }            │
+        │ ──────────────────────────────────────────────────► │
+        │                                                       │
+        │                                  PBKDF2 100k + salt   │
+        │                                  写入 D1 (users)       │
+        │                                  签发 JWT + Refresh    │
+        │                                                       │
+        │ ◄─────────────────────────────────────────────────── │
+        │     { token, refreshToken, user }                      │
+        │                                                       │
+        │  2. GET  /auth/verify   Bearer <token>                 │
+        │ ──────────────────────────────────────────────────► │
+        │                              ★ 中途若账号被封禁        │
+        │                              ★ 这里立刻 403 banned     │
+        │ ◄─────────────────────────────────────────────────── │
+        │                                                       │
+        │  3. JWT 1h 过期，自动 refresh（SDK 内置单飞锁）         │
+        │ ──────────────────────────────────────────────────► │
+        │ ◄─────────────────────────────────────────────────── │
+        │     { token (new), refreshToken (rotated) }            │
+        │                                                       │
+```
+
+```
+   OIDC SSO 跨应用                                       AuthCore Gateway
+   ─────────────────                                    ─────────────────
+        │                                                       │
+        │  /oauth/authorize ?response_type=code &PKCE &state     │
+        │ ──────────────────────────────────────────────────► │
+        │                                                       │
+        │       用户在 AuthCore 授权页确认（Google 风格）         │
+        │                                                       │
+        │ ◄─ 302 redirect_uri ?code=xxx &state=yyy ─────────── │
+        │                                                       │
+        │  POST /oauth/token  { code, code_verifier }            │
+        │ ──────────────────────────────────────────────────► │
+        │ ◄─ { access_token, refresh_token, id_token (RS256) } │
+        │                                                       │
+        │  GET  /oauth/userinfo  Bearer <access_token>           │
+        │ ──────────────────────────────────────────────────► │
+        │ ◄─ { sub, email, name, picture, email_verified } ─── │
 ```
 
 ## 为什么选 AuthCore
