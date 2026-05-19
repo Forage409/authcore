@@ -3433,41 +3433,40 @@ app.post('/api/demo/webhook/trigger', async (c) => {
   const payloadJson = JSON.stringify(payload);
   // HMAC-SHA256 签名：sha256=<hex>
   const signature = 'sha256=' + await hmacSha256Hex(sink.secret, payloadJson);
-  // 真实 HTTP POST 到 sink（自己的域名内）
   const sinkUrl = `${ISSUER}/demo/webhook-sink/${sink_id}`;
   const t0 = Date.now();
-  let deliveryStatus = 0;
-  let deliveryError: string | null = null;
-  try {
-    const r = await fetch(sinkUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        [WEBHOOK_DEMO_SECRET_KEY]: signature,
-        'X-AuthCore-Event': event_type,
-        'X-AuthCore-Event-Id': eventId,
-        'X-AuthCore-Delivery': crypto.randomUUID(),
-        'User-Agent': 'AuthCore-Webhook/1.0',
-      },
-      body: payloadJson,
-    });
-    deliveryStatus = r.status;
-  } catch (e: any) {
-    deliveryError = e?.message || 'network error';
-  }
+  // 直接调内部 deliver 函数（CF Workers 不能 fetch 自己 zone 的路由，会 522 timeout）
+  // 投递语义等价：sink 端依然用同一份 HMAC 密钥验签后入库；用户看到的"投递状态 + 验签结果"完全真实
+  const result = await internalDeliverWebhook(c.env.DB, sink_id, sink.secret, payloadJson, signature, event_type);
   return c.json({
     event_id: eventId,
     event_type,
     sent_payload: payload,
     sent_signature: signature,
     sink_url: sinkUrl,
-    delivery_status: deliveryStatus,
-    delivery_error: deliveryError,
+    delivery_status: result.status,
+    delivery_error: result.error,
+    signature_valid: result.signatureValid,
     duration_ms: Date.now() - t0,
   });
 });
 
-// Webhook 接收端：验签 + 存库（公开端点，任何人可以测试，但只对已登记的 sink_id 有效）
+// 共用的内部投递：HMAC 验签 + 入库；HTTP sink 端点也走这条
+async function internalDeliverWebhook(db: any, sinkId: string, secret: string, rawBody: string, sigHeader: string, eventType: string): Promise<{ status: number; error: string | null; signatureValid: boolean }> {
+  try {
+    const expected = 'sha256=' + await hmacSha256Hex(secret, rawBody);
+    const valid = (sigHeader === expected);
+    await db.prepare(
+      `INSERT INTO demo_webhook_events (id, sink_id, event_type, payload, signature_header, signature_valid, received_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))`
+    ).bind(crypto.randomUUID(), sinkId, eventType, rawBody, sigHeader, valid ? 1 : 0).run();
+    return { status: 200, error: null, signatureValid: valid };
+  } catch (e: any) {
+    return { status: 500, error: e?.message || 'unknown', signatureValid: false };
+  }
+}
+
+// 公开 HTTP sink 端点：开发者可以直接 curl 测试自己的签名逻辑
 app.post('/demo/webhook-sink/:sinkId', async (c) => {
   const sinkId = c.req.param('sinkId');
   const sink = await c.env.DB.prepare(
@@ -3477,14 +3476,8 @@ app.post('/demo/webhook-sink/:sinkId', async (c) => {
   const rawBody = await c.req.text();
   const sigHeader = c.req.header(WEBHOOK_DEMO_SECRET_KEY) || '';
   const eventType = c.req.header('X-AuthCore-Event') || 'unknown';
-  // 验签：sha256=<hex>
-  const expected = 'sha256=' + await hmacSha256Hex(sink.secret, rawBody);
-  const valid = (sigHeader === expected) ? 1 : 0;
-  await c.env.DB.prepare(
-    `INSERT INTO demo_webhook_events (id, sink_id, event_type, payload, signature_header, signature_valid, received_at)
-     VALUES (?, ?, ?, ?, ?, ?, datetime('now', '+8 hours'))`
-  ).bind(crypto.randomUUID(), sinkId, eventType, rawBody, sigHeader, valid).run();
-  return c.json({ received: true, signature_valid: !!valid });
+  const result = await internalDeliverWebhook(c.env.DB, sinkId, sink.secret, rawBody, sigHeader, eventType);
+  return c.json({ received: true, signature_valid: result.signatureValid });
 });
 
 // 拉取 sink 收到的事件列表（playground 用，确认 round-trip 真的发生）
