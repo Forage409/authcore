@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>注册 · AuthCore</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="card" data-bootstrap="pending" id="card">
+      <h1>注册</h1>
+      <p class="subtitle">创建你的账号</p>
+
+      <!-- 自动检测后填入 -->
+
+      <form id="register-form" novalidate>
+        <!-- 邮箱（验证模式下右侧附带「发送验证码」） -->
+        <div class="form-group">
+          <label for="reg-email">邮箱</label>
+          <div class="input-row" id="email-row">
+            <input type="email" id="reg-email" placeholder="you@example.com" autocomplete="email" required maxlength="254">
+            <button type="button" id="send-code-btn" class="btn-side" style="display:none;">获取验证码</button>
+          </div>
+        </div>
+
+        <!-- 验证码（仅验证模式下渲染） -->
+        <div class="form-group" id="code-group" style="display:none;">
+          <label for="reg-code">验证码</label>
+          <input type="text" id="reg-code" placeholder="6 位验证码" maxlength="6" inputmode="numeric" autocomplete="one-time-code">
+          <div class="hint-text" id="code-hint">点击右侧按钮获取，验证码 5 分钟内有效</div>
+        </div>
+
+        <!-- 状态提示 -->
+        <div class="verify-status" id="verify-status"></div>
+
+        <!-- 密码 -->
+        <div class="form-group">
+          <label for="reg-password">密码</label>
+          <input type="password" id="reg-password" placeholder="至少 8 位，含大小写字母和数字" required minlength="8" maxlength="128" autocomplete="new-password">
+        </div>
+
+        <!-- 用户名 -->
+        <div class="form-group">
+          <label for="reg-username">用户名（选填）</label>
+          <input type="text" id="reg-username" placeholder="留空则使用邮箱前缀" autocomplete="username" maxlength="32">
+        </div>
+
+        <div class="error-msg" id="reg-error"></div>
+        <button type="submit" id="register-btn" class="btn btn-primary">注册</button>
+      </form>
+
+      <p class="link-text">已有账号？<a href="/">立即登录</a></p>
+    </div>
+  </div>
+
+  <script src="/js/app.js"></script>
+  <script>
+    /**
+     * 设计要点：
+     *  1. 页面打开即调用 /api/config 自检：API Key 未开邮箱验证 → 不渲染验证 UI
+     *  2. 已开启验证时，只有「获取验证码」一个侧边按钮；不再有独立的「验证」按钮
+     *  3. 验证逻辑统一在「注册」提交时完成（verify-code → register 串联）
+     */
+    const card        = document.getElementById('card');
+    const emailInput  = document.getElementById('reg-email');
+    const codeGroup   = document.getElementById('code-group');
+    const codeInput   = document.getElementById('reg-code');
+    const codeHint    = document.getElementById('code-hint');
+    const sendBtn     = document.getElementById('send-code-btn');
+    const verifyStatus= document.getElementById('verify-status');
+    const registerBtn = document.getElementById('register-btn');
+    const errEl       = document.getElementById('reg-error');
+
+    let requireVerify = false;   // 应用是否要求邮箱验证（由后端配置决定）
+    let codeSent      = false;   // 当前已发送过验证码
+
+    // ── 引导：拉配置后再显示卡片 ──
+    (async function bootstrap() {
+      try {
+        const cfg = await getConfig();
+        requireVerify = !!cfg.require_email_verification;
+      } catch { requireVerify = false; }
+
+      // 仅在启用邮箱验证时显示验证码 UI；未启用时静默直接渲染普通注册表单
+      if (requireVerify) {
+        codeGroup.style.display = 'block';
+        sendBtn.style.display = 'inline-block';
+      }
+      card.removeAttribute('data-bootstrap');
+    })();
+
+    // ── 发送验证码（仅在验证模式下出现） ──
+    sendBtn.addEventListener('click', async () => {
+      const email = emailInput.value.trim();
+      if (!email) return showErr('请先输入邮箱');
+      sendBtn.disabled = true;
+      sendBtn.textContent = '发送中...';
+      clearErr();
+      try {
+        const data = await api('/user/send-code', {
+          method: 'POST',
+          body: JSON.stringify({ email }),
+        });
+        if (data.error === 'verification_disabled') {
+          // 后端配置变了：降级为无需验证
+          requireVerify = false;
+          codeGroup.style.display = 'none';
+          sendBtn.style.display = 'none';
+          setStatus('ok', '此应用无需邮箱验证，可直接注册');
+          return;
+        }
+        if (data.error === 'quota_exceeded') {
+          // 全社区邮件配额耗尽 — 后端会临时强制关闭验证开关，前端跟着降级
+          requireVerify = false;
+          codeGroup.style.display = 'none';
+          sendBtn.style.display = 'none';
+          setStatus('ok', '今日邮件配额已用完，已自动切换为直接注册（明日恢复）');
+          return;
+        }
+        if (data.error === 'email_registered') {
+          // 邮箱已注册，直接引导去登录，避免浪费配额
+          showErr('该邮箱已注册，请前往登录页面');
+          sendBtn.disabled = false;
+          sendBtn.textContent = '获取验证码';
+          return;
+        }
+        if (data.email_sent || data.success) {
+          codeSent = true;
+          setStatus('ok', '验证码已发送至 ' + escapeHtml(email) + '，5 分钟内有效');
+          codeInput.focus();
+          startCooldown(60);
+        } else {
+          showErr(data.message || data.error || '发送失败，请稍后重试');
+          sendBtn.disabled = false;
+          sendBtn.textContent = '获取验证码';
+        }
+      } catch {
+        showErr('网络错误，请重试');
+        sendBtn.disabled = false;
+        sendBtn.textContent = '获取验证码';
+      }
+    });
+
+    function startCooldown(sec) {
+      sendBtn.disabled = true;
+      const tick = () => {
+        if (sec <= 0) {
+          sendBtn.textContent = '重新发送';
+          sendBtn.disabled = false;
+          return;
+        }
+        sendBtn.textContent = sec + 's 后重发';
+        sec--;
+        setTimeout(tick, 1000);
+      };
+      tick();
+    }
+
+    // ── 提交：验证 + 注册一体化 ──
+    document.getElementById('register-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      clearErr();
+
+      const email    = emailInput.value.trim();
+      const password = document.getElementById('reg-password').value;
+      const username = document.getElementById('reg-username').value.trim() || undefined;
+      const code     = codeInput.value.trim();
+
+      if (!email)              return showErr('请输入邮箱');
+      if (password.length < 8) return showErr('密码至少 8 位');
+      if (!/[A-Z]/.test(password)) return showErr('密码需包含大写字母');
+      if (!/[a-z]/.test(password)) return showErr('密码需包含小写字母');
+      if (!/[0-9]/.test(password)) return showErr('密码需包含数字');
+
+      if (requireVerify) {
+        if (!codeSent)               return showErr('请先点击「获取验证码」');
+        if (!code || code.length !== 6) return showErr('请输入 6 位验证码');
+      }
+
+      registerBtn.disabled = true;
+      registerBtn.innerHTML = '注册中...<span class="btn-spinner"></span>';
+
+      try {
+        // 1) 若需要验证：先校验验证码
+        if (requireVerify) {
+          const v = await api('/user/verify-code', {
+            method: 'POST',
+            body: JSON.stringify({ email, code }),
+          });
+          if (!v.valid) {
+            showErr(v.message || '验证码错误或已过期，请重新获取');
+            registerBtn.disabled = false;
+            registerBtn.textContent = '注册';
+            return;
+          }
+        }
+
+        // 2) 注册
+        const data = await api('/user/register', {
+          method: 'POST',
+          body: JSON.stringify({ email, password, username }),
+        });
+
+        if (data.error) {
+          showErr(data.error);
+          registerBtn.disabled = false;
+          registerBtn.textContent = '注册';
+        } else {
+          saveToken(data.token);
+          saveUser(data.user);
+          if (data.refreshToken) saveRefreshToken(data.refreshToken);
+          localStorage.setItem('login_method', 'password');
+          window.location.href = '/dashboard.html';
+        }
+      } catch {
+        showErr('注册失败，请重试');
+        registerBtn.disabled = false;
+        registerBtn.textContent = '注册';
+      }
+    });
+
+    // ── 工具 ──
+    function showErr(msg) { errEl.textContent = msg; errEl.classList.add('show'); }
+    function clearErr()   { errEl.classList.remove('show'); errEl.textContent = ''; }
+    function setStatus(kind, msg) {
+      verifyStatus.textContent = msg;
+      verifyStatus.className = 'verify-status ' + (kind === 'ok' ? 'ok' : 'err');
+    }
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+  </script>
+</body>
+</html>

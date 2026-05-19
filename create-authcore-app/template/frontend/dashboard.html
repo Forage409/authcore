@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>控制台 · AuthCore</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body class="console-body">
+  <!-- 侧边栏 -->
+  <aside class="console-sidebar" id="sidebar">
+    <div class="console-side-head">
+      <div class="console-logo">A</div>
+      <div>
+        <div class="console-logo-text">AuthCore</div>
+        <div class="console-logo-sub">控制台</div>
+      </div>
+    </div>
+    <nav class="console-nav">
+      <a class="console-nav-item active" data-tab="tab-token" onclick="switchTab('tab-token', this)">Token 管理</a>
+      <a class="console-nav-item" data-tab="tab-email" onclick="switchTab('tab-email', this)">邮箱验证</a>
+    </nav>
+    <div class="console-side-foot">
+      <div class="console-side-user">
+        <div class="console-avatar" id="sidebar-avatar"></div>
+        <div class="console-side-user-info">
+          <div class="console-side-username" id="sidebar-name">-</div>
+          <div class="console-side-email" id="sidebar-email">-</div>
+        </div>
+      </div>
+      <button class="btn btn-secondary" style="width:100%;padding:9px;font-size:12px" onclick="logout()">退出登录</button>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <div class="console-main">
+    <header class="console-topbar">
+      <button class="console-menu-btn" onclick="toggleSidebar()">&#9776;</button>
+      <div class="console-crumbs">控制台 <span>/</span> <strong id="crumb-title">Token 管理</strong></div>
+      <div class="console-topbar-right">
+        <span class="console-topbar-email" id="topbar-email">-</span>
+        <div class="console-avatar" id="topbar-avatar"></div>
+      </div>
+    </header>
+
+    <main class="console-content">
+      <!-- Tab: Token -->
+      <div class="tab-panel active" id="tab-token">
+        <!-- Hero: 账号信息 -->
+        <div class="hero-card">
+          <div class="hero-avatar" id="hero-avatar"></div>
+          <div class="hero-info">
+            <div class="hero-name" id="user-name">-</div>
+            <div class="hero-email" id="user-email">-</div>
+            <div class="hero-meta">
+              <span class="meta-label">ID</span>
+              <code class="meta-value" id="user-id">-</code>
+              <span class="meta-label">登录方式</span>
+              <span class="meta-pill" id="user-method">password</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 操作卡片网格 -->
+        <div class="action-grid">
+          <div class="section action-card">
+            <div class="action-head">
+              <div class="action-icon icon-mint">✓</div>
+              <h2>验证 Token</h2>
+            </div>
+            <p class="section-desc">调用 /api/user/verify 校验当前 Token（支持 AuthCore JWT 与 OIDC access_token 双通道）</p>
+            <button class="btn btn-primary" onclick="verifyToken()">验证我的 Token</button>
+            <pre class="result-box" id="verify-result"></pre>
+          </div>
+
+          <div class="section action-card">
+            <div class="action-head">
+              <div class="action-icon icon-mint">↻</div>
+              <h2>刷新 Token</h2>
+            </div>
+            <p class="section-desc">JWT 过期后用 Refresh Token 获取新 Token（自动识别 password / OIDC 模式）</p>
+            <button class="btn btn-primary" onclick="refreshToken()">刷新 Token</button>
+            <pre class="result-box" id="refresh-result"></pre>
+          </div>
+
+          <div class="section action-card action-card-wide">
+            <div class="action-head">
+              <div class="action-icon icon-danger">!</div>
+              <h2>撤销 Token</h2>
+            </div>
+            <p class="section-desc">撤销 Refresh Token，使其无法再刷新；该操作不可恢复</p>
+            <button class="btn btn-danger" onclick="revokeToken()">撤销 Refresh Token</button>
+            <pre class="result-box" id="revoke-result"></pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Email Verification -->
+      <div class="tab-panel" id="tab-email">
+        <div class="section">
+          <h2>发送验证码</h2>
+          <p class="section-desc">需要 API Key 开启邮箱验证功能</p>
+          <div class="form-group">
+            <label>邮箱</label>
+            <input type="email" id="demo-email" placeholder="user@example.com" value="" maxlength="254">
+          </div>
+          <button class="btn btn-primary" style="width:auto" id="demo-send-btn" onclick="demoSendCode()">发送验证码</button>
+          <div class="result-box" id="send-code-result"></div>
+        </div>
+
+        <div class="section">
+          <h2>验证验证码</h2>
+          <div class="form-group">
+            <label>邮箱</label>
+            <input type="email" id="demo-verify-email" placeholder="user@example.com" maxlength="254">
+          </div>
+          <div class="form-group">
+            <label>验证码</label>
+            <input type="text" id="demo-code" placeholder="6 位验证码" maxlength="6">
+          </div>
+          <button class="btn btn-primary" style="width:auto" onclick="demoVerifyCode()">验证</button>
+          <div class="result-box" id="verify-code-result"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/js/app.js"></script>
+  <script>
+    const auth = checkAuth();
+    if (auth) {
+      var u = auth.user;
+      document.getElementById('user-id').textContent = u.id;
+      document.getElementById('user-email').textContent = u.email;
+      document.getElementById('user-name').textContent = u.username || u.email.split('@')[0];
+      document.getElementById('user-method').textContent = getLoginMethod() === 'oidc' ? 'OIDC' : 'password';
+      document.getElementById('demo-email').value = u.email;
+      document.getElementById('demo-verify-email').value = u.email;
+
+      var initial = (u.username || u.email || 'U').slice(0,2).toUpperCase();
+      document.getElementById('hero-avatar').textContent = initial;
+      document.getElementById('sidebar-avatar').textContent = initial;
+      document.getElementById('topbar-avatar').textContent = initial;
+      document.getElementById('sidebar-name').textContent = u.username || u.email.split('@')[0];
+      document.getElementById('sidebar-email').textContent = u.email;
+      document.getElementById('topbar-email').textContent = u.email;
+    }
+
+    // ── Tabs ──
+    function switchTab(tabId, el) {
+      document.querySelectorAll('.console-nav-item').forEach(function(x){ x.classList.remove('active'); });
+      document.querySelectorAll('.tab-panel').forEach(function(x){ x.classList.remove('active'); });
+      el.classList.add('active');
+      document.getElementById(tabId).classList.add('active');
+      document.getElementById('crumb-title').textContent = el.textContent;
+    }
+
+    function toggleSidebar() {
+      document.getElementById('sidebar').classList.toggle('open');
+    }
+
+    // ── Token ──
+    function setBtnLoading(btn, loading, text) {
+      if (!btn) return;
+      if (loading && !btn.dataset.original) btn.dataset.original = btn.textContent;
+      btn.disabled = loading;
+      btn.textContent = loading ? (text || '处理中...') : (btn.dataset.original || '');
+    }
+
+    async function verifyToken() {
+      var token = getToken();
+      var el = document.getElementById('verify-result');
+      var btn = event.target;
+      setBtnLoading(btn, true, '验证中...');
+      var data = await api('/user/verify', { method: 'POST', body: JSON.stringify({ token: token }) });
+      el.textContent = JSON.stringify(data, null, 2);
+      el.classList.add('show');
+      setBtnLoading(btn, false);
+    }
+
+    async function refreshToken() {
+      var rt = localStorage.getItem('refresh_token') || '';
+      var el = document.getElementById('refresh-result');
+      var btn = event.target;
+      if (!rt) { el.textContent = '未找到 Refresh Token（请先登录）'; el.classList.add('show'); return; }
+      setBtnLoading(btn, true, '刷新中...');
+      var isOidc = getLoginMethod() === 'oidc';
+      var body = isOidc
+        ? { refreshToken: rt, oidc: true, clientId: localStorage.getItem('oidc_client_id') || '' }
+        : { refreshToken: rt };
+      var data = await api('/user/refresh', { method: 'POST', body: JSON.stringify(body) });
+      if (data.token) saveToken(data.token);
+      if (data.access_token) saveToken(data.access_token);
+      if (data.refreshToken) localStorage.setItem('refresh_token', data.refreshToken);
+      if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
+      el.textContent = JSON.stringify(data, null, 2);
+      el.classList.add('show');
+      setBtnLoading(btn, false);
+    }
+
+    async function revokeToken() {
+      var rt = localStorage.getItem('refresh_token') || '';
+      var el = document.getElementById('revoke-result');
+      var btn = event.target;
+      if (!rt) { el.textContent = '未找到 Refresh Token'; el.classList.add('show'); return; }
+      if (!confirm('确定撤销当前 Refresh Token？该操作不可恢复，撤销后需重新登录。')) return;
+      setBtnLoading(btn, true, '撤销中...');
+      var isOidc = getLoginMethod() === 'oidc';
+      var body = {
+        refreshToken: rt,
+        oidc: isOidc,
+        clientId: isOidc ? (localStorage.getItem('oidc_client_id') || '') : undefined,
+      };
+      var data = await api('/user/revoke', { method: 'POST', body: JSON.stringify(body) });
+      if (data.success) localStorage.removeItem('refresh_token');
+      el.textContent = JSON.stringify(data, null, 2);
+      el.classList.add('show');
+      setBtnLoading(btn, false);
+    }
+
+    // ── Email ──
+    async function demoSendCode() {
+      var email = document.getElementById('demo-email').value.trim();
+      var el = document.getElementById('send-code-result');
+      var btn = document.getElementById('demo-send-btn');
+      if (!email) { el.textContent = '请先输入邮箱'; el.classList.add('show'); return; }
+      setBtnLoading(btn, true, '发送中...');
+      var data = await api('/user/send-code', { method: 'POST', body: JSON.stringify({ email: email }) });
+      el.textContent = JSON.stringify(data, null, 2);
+      el.classList.add('show');
+      setBtnLoading(btn, false);
+    }
+
+    async function demoVerifyCode() {
+      var email = document.getElementById('demo-verify-email').value.trim();
+      var code = document.getElementById('demo-code').value.trim();
+      var el = document.getElementById('verify-code-result');
+      if (!email || !code) { el.textContent = '请填写邮箱和验证码'; el.classList.add('show'); return; }
+      var data = await api('/user/verify-code', { method: 'POST', body: JSON.stringify({ email: email, code: code }) });
+      el.textContent = JSON.stringify(data, null, 2);
+      el.classList.add('show');
+    }
+  </script>
+</body>
+</html>

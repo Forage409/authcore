@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>登录</h1>
+      <p class="subtitle">使用你的账号登录</p>
+
+      <div class="notice-msg" id="revoked-notice" style="display:none;">您的授权已被撤销，请重新登录。</div>
+
+      <!-- OIDC 一键登录入口：仅当控制台开启 OIDC 时自动显示，开发者无需手动接入 -->
+      <div id="oidc-block" style="display:none;">
+        <button type="button" class="btn btn-oidc" id="oidc-btn">用 AuthCore 一键登录</button>
+        <div class="oidc-divider"><span>或使用邮箱密码</span></div>
+      </div>
+
+      <form id="login-form">
+        <div class="form-group">
+          <label>邮箱</label>
+          <input type="email" id="login-email" placeholder="user@example.com" required maxlength="254">
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input type="password" id="login-password" placeholder="至少 8 位" required maxlength="128">
+        </div>
+        <div class="error-msg" id="login-error"></div>
+        <button type="submit" class="btn btn-primary" id="login-btn">
+          <span class="btn-text">登录</span>
+          <span class="btn-spinner" style="display:none;"></span>
+        </button>
+      </form>
+
+      <p class="link-text">还没有账号？<a href="/register.html">立即注册</a></p>
+    </div>
+  </div>
+
+  <script src="/js/app.js"></script>
+  <script>
+    // 撤销提示
+    if (new URLSearchParams(location.search).get('reason') === 'revoked') {
+      document.getElementById('revoked-notice').style.display = 'block';
+    }
+
+    // 自动检测 OIDC：若控制台开启了 OIDC，显示一键登录按钮（开发者无需手动接入）
+    (async () => {
+      try {
+        const cfg = await getConfig();
+        if (cfg && cfg.oidc_enabled && cfg.oidc_authorize_url && cfg.oidc_default_redirect_uri && cfg.client_id) {
+          document.getElementById('oidc-block').style.display = 'block';
+          document.getElementById('oidc-btn').addEventListener('click', async () => {
+            const state = crypto.randomUUID();
+            // PKCE: 生成 code_verifier（存 cookie 供后端回调时读取），code_challenge 入授权 URL
+            const verifierBytes = crypto.getRandomValues(new Uint8Array(32));
+            const verifier = btoa(String.fromCharCode(...verifierBytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+            const challengeBytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+            const challenge = btoa(String.fromCharCode(...new Uint8Array(challengeBytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+            document.cookie = 'oidc_verifier=' + verifier + '; path=/; max-age=300; SameSite=Lax';
+            // state 写 cookie 供后端回调校验（防 CSRF），同时存 sessionStorage 以便前端二次确认
+            document.cookie = 'oidc_state=' + state + '; path=/; max-age=300; SameSite=Lax';
+            sessionStorage.setItem('oidc_state', state);
+            const params = new URLSearchParams({
+              client_id: cfg.client_id,
+              redirect_uri: cfg.oidc_default_redirect_uri,
+              response_type: 'code',
+              scope: 'openid email profile',
+              state,
+              code_challenge: challenge,
+              code_challenge_method: 'S256',
+            });
+            location.assign(cfg.oidc_authorize_url + '?' + params);
+          });
+        }
+      } catch { /* 配置拉取失败不影响密码登录 */ }
+    })();
+
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('login-email').value;
+      const password = document.getElementById('login-password').value;
+      const btn = document.getElementById('login-btn');
+      const btnText = btn.querySelector('.btn-text');
+      const btnSpinner = btn.querySelector('.btn-spinner');
+      const errEl = document.getElementById('login-error');
+      btn.disabled = true;
+      btnText.textContent = '登录中...';
+      btnSpinner.style.display = 'inline-block';
+
+      const data = await api('/user/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      });
+
+      if (data.error) {
+        errEl.textContent = data.error;
+        errEl.classList.add('show');
+        btn.disabled = false;
+        btnText.textContent = '登录';
+        btnSpinner.style.display = 'none';
+      } else {
+        saveToken(data.token);
+        saveUser(data.user);
+        if (data.refreshToken) saveRefreshToken(data.refreshToken);
+        localStorage.setItem('login_method', 'password');
+        window.location.href = '/dashboard.html';
+      }
+    });
+  </script>
+</body>
+</html>

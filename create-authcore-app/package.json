@@ -1,0 +1,26 @@
+{
+  "name": "create-nexus-auth",
+  "version": "2.10.1",
+  "description": "AuthCore 脚手架 — 一键创建带登录/注册的认证应用。零外部私有依赖，开箱即用。",
+  "main": "bin/create.js",
+  "bin": {
+    "create-nexus-auth": "bin/create.js"
+  },
+  "files": [
+    "bin",
+    "template",
+    "template/.*",
+    "template-oidc",
+    "README.md"
+  ],
+  "keywords": [
+    "authcore",
+    "auth",
+    "authentication",
+    "scaffold",
+    "create",
+    "login",
+    "register"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,10 @@
+{
+  "name": "authcore-oidc-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AuthCore OIDC 接入示例 — 纯前端 SPA，无需后端",
+  "scripts": {
+    "start": "npx --yes http-server -p 3000 -c-1 . -s",
+    "dev": "npm start"
+  }
+}

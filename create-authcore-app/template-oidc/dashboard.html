@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>控制台 · AuthCore OIDC</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="console-body">
+  <!-- 侧边栏 -->
+  <aside class="console-sidebar" id="sidebar">
+    <div class="console-side-head">
+      <div class="console-logo">A</div>
+      <div>
+        <div class="console-logo-text">AuthCore</div>
+        <div class="console-logo-sub">OIDC</div>
+      </div>
+    </div>
+    <nav class="console-nav">
+      <a class="console-nav-item active" data-tab="tab-profile" onclick="switchTab('tab-profile', this)">账号概览</a>
+      <a class="console-nav-item" data-tab="tab-userinfo" onclick="switchTab('tab-userinfo', this)">UserInfo</a>
+      <a class="console-nav-item" data-tab="tab-idtoken" onclick="switchTab('tab-idtoken', this)">ID Token</a>
+    </nav>
+    <div class="console-side-foot">
+      <div class="console-side-user">
+        <div class="console-avatar" id="sidebar-avatar">U</div>
+        <div class="console-side-user-info">
+          <div class="console-side-username" id="sidebar-name">-</div>
+          <div class="console-side-email" id="sidebar-email">-</div>
+        </div>
+      </div>
+      <button class="btn btn-secondary" style="width:100%;padding:9px;font-size:12px" onclick="signOut()">退出登录</button>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <div class="console-main">
+    <header class="console-topbar">
+      <button class="console-menu-btn" onclick="toggleSidebar()">&#9776;</button>
+      <div class="console-crumbs">控制台 <span>/</span> <strong id="crumb-title">账号概览</strong></div>
+      <div class="console-topbar-right">
+        <span class="console-topbar-email" id="topbar-email">-</span>
+        <div class="console-avatar" id="topbar-avatar">U</div>
+      </div>
+    </header>
+
+    <main class="console-content">
+      <!-- Tab: 账号概览 -->
+      <div class="tab-panel active" id="tab-profile">
+        <div class="section">
+          <h2>当前账号</h2>
+          <p class="section-desc">点击下方任一字段可全选并复制</p>
+          <div class="info-row">
+            <div class="info-label">Sub · ID</div>
+            <div class="info-value" id="sub" onclick="copyValue(this)">-</div>
+          </div>
+          <div class="info-row">
+            <div class="info-label">邮箱</div>
+            <div class="info-value" id="email" onclick="copyValue(this)">-</div>
+          </div>
+          <div class="info-row">
+            <div class="info-label">用户名</div>
+            <div class="info-value" id="name" onclick="copyValue(this)">-</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: UserInfo -->
+      <div class="tab-panel" id="tab-userinfo">
+        <div class="section">
+          <h2>UserInfo 端点</h2>
+          <p class="section-desc">GET /oauth/userinfo — 用 access_token 拉当前用户资料</p>
+          <button class="btn btn-primary" style="width:auto" onclick="loadUserinfo()">刷新 UserInfo</button>
+          <pre class="result-box" id="userinfo-result"></pre>
+        </div>
+      </div>
+
+      <!-- Tab: ID Token -->
+      <div class="tab-panel" id="tab-idtoken">
+        <div class="section">
+          <h2>ID Token (RS256)</h2>
+          <p class="section-desc">由 AuthCore 签发，可用 JWKS 公钥验证签名</p>
+          <pre class="result-box show" style="font-size:10px;word-break:break-all;" id="idtoken"></pre>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="js/oidc.js"></script>
+  <script>
+    var oidc = new OidcClient(window.AUTHCORE_OIDC_CONFIG);
+    if (!oidc.getAccessToken()) { location.href = 'index.html'; }
+
+    // 撤销授权后自动登出（user.miaogou.site 撤销授权时本应用感知 401 自动清理）
+    oidc.onSessionRevoked(function () {
+      try { oidc.signOut(); } catch (e) {}
+      location.replace('index.html?reason=revoked');
+    });
+    oidc.startSessionWatch(60000);
+
+    var id = oidc.getIdToken();
+    if (id) {
+      var parts = id.split('.');
+      var payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+      document.getElementById('sub').textContent = payload.sub || '-';
+      document.getElementById('email').textContent = payload.email || '-';
+      document.getElementById('name').textContent = payload.name || '-';
+      document.getElementById('idtoken').textContent = id;
+
+      var initial = (payload.name || payload.email || 'U').slice(0,2).toUpperCase();
+      document.getElementById('sidebar-avatar').textContent = initial;
+      document.getElementById('topbar-avatar').textContent = initial;
+      document.getElementById('sidebar-name').textContent = payload.name || payload.email.split('@')[0];
+      document.getElementById('sidebar-email').textContent = payload.email || '-';
+      document.getElementById('topbar-email').textContent = payload.email || '-';
+    }
+
+    function switchTab(tabId, el) {
+      document.querySelectorAll('.console-nav-item').forEach(function(x){ x.classList.remove('active'); });
+      document.querySelectorAll('.tab-panel').forEach(function(x){ x.classList.remove('active'); });
+      el.classList.add('active');
+      document.getElementById(tabId).classList.add('active');
+      document.getElementById('crumb-title').textContent = el.textContent;
+    }
+
+    function toggleSidebar() {
+      document.getElementById('sidebar').classList.toggle('open');
+    }
+
+    async function loadUserinfo() {
+      try {
+        var u = await oidc.userInfo();
+        var el = document.getElementById('userinfo-result');
+        el.textContent = JSON.stringify(u, null, 2);
+        el.classList.add('show');
+      } catch (e) { alert(e.message); }
+    }
+
+    async function signOut() {
+      await oidc.signOut();
+      location.href = 'index.html';
+    }
+
+    function copyValue(el) {
+      var text = (el.textContent || '').trim();
+      if (!text || text === '-') return;
+      var done = function () {
+        el.classList.add('copied');
+        var prev = el.dataset.label || el.textContent;
+        el.dataset.label = prev;
+        el.textContent = '已复制';
+        setTimeout(function () {
+          el.classList.remove('copied');
+          el.textContent = el.dataset.label || text;
+        }, 900);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(function () {});
+      } else {
+        try {
+          var r = document.createRange(); r.selectNodeContents(el);
+          var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+          document.execCommand('copy'); done();
+        } catch (e) {}
+      }
+    }
+  </script>
+</body>
+</html>

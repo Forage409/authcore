@@ -1,0 +1,33 @@
+name = "nexus-gateway"
+main = "index.ts"
+compatibility_date = "2025-05-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexus-db"
+database_id = "0dd11ef8-3fc1-4748-a2a9-d8d6b0238a43"
+
+[[r2_buckets]]
+binding = "AVATARS"
+bucket_name = "nexus-avatars"
+
+[[routes]]
+pattern = "auth.miaogou.site/*"
+zone_name = "miaogou.site"
+
+[assets]
+directory = "./frontend/dist"
+binding = "ASSETS"
+# 必须 true：默认情况下 dist 里有精确匹配的文件（如 index.html / .js / .css）会被 CF
+# 静态资源层直接返回，跳过 Worker 代码。开启后所有请求都先进入 Worker，由 fetch
+# handler 决定走 ASSETS 还是别的逻辑，保证我们注入的安全响应头永远生效。
+run_worker_first = true
+
+[observability]
+enabled = true
+
+# Cron: 自助注销 14 天后真删；每小时跑一次足够（注销时间精度 1 小时无所谓）
+# 同时检查 24 小时内即将到期的注销发提醒邮件
+[triggers]
+crons = ["0 * * * *"]
+

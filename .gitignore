@@ -1,0 +1,99 @@
+# ── 依赖 ─────────────────────────────────
+node_modules/
+.pnp
+.pnp.js
+
+# ── 构建产物 ─────────────────────────────
+dist/
+dist-ssr/
+build/
+*.tsbuildinfo
+
+# ── 环境变量 / Secret ────────────────────
+.env
+.env.local
+.env.*.local
+.dev.vars
+*.local
+
+# ── Cloudflare ───────────────────────────
+.wrangler/
+.wrangler-*/
+.mf/
+wrangler.toml.bak
+
+# ── 日志 ─────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ── 编辑器 / IDE ─────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.trae/
+.cursor/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ── 操作系统 ─────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Claude Code 本地配置 ─────────────────
+.claude/
+
+# ── 个人备份目录（不属于源码）────────────
+_backup_design_*/
+
+# ── 杂项 ─────────────────────────────────
+*.tmp
+*.temp
+.cache/
+coverage/
+
+# ── 本地 dev 配置 ─────────────────────────
+config.yml
+
+# ── 仅开源 nexus-gateway 后端 + SDK + CLI，其他全部本地保留 ─
+# 顶层 React 个人站
+/src/
+/public/
+/index.html
+/vite.config.ts
+/tailwind.config.js
+/postcss.config.js
+/eslint.config.js
+/tsconfig*.json
+/package.json
+/package-lock.json
+/pnpm-lock.yaml
+/logo.png
+/userlogo.png
+/zhuye.png
+/CLAUDE.md
+/DESIGN*.md
+/scripts/
+
+# 个人站相关 Worker（非 gateway）
+/workers/api/
+/workers/nexus-auth/
+/workers/nexus-api/
+/workers/nexus-user/
+/workers/shared/
+/workers/schema.sql
+/workers/wrangler.toml
+/workers/package.json
+/workers/package-lock.json
+
+# 网关前端不开源
+/workers/nexus-gateway/frontend/
+

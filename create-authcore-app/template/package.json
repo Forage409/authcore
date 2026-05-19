@@ -1,0 +1,11 @@
+{
+  "name": "authcore-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AuthCore 认证应用 — 前端 + 后端转发",
+  "scripts": {
+    "start": "npm start --prefix backend",
+    "dev": "npm run dev --prefix backend",
+    "install:all": "npm install --prefix backend"
+  }
+}

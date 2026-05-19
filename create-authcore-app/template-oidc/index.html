@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 · AuthCore OIDC</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>欢迎</h1>
+      <p class="subtitle">使用 AuthCore 账号登录</p>
+      <div class="notice-msg" id="revoked-notice" style="display:none;">您的授权已被撤销，请重新登录。</div>
+      <button id="signin" class="btn btn-primary">用 AuthCore 登录</button>
+      <p class="link-text" id="hint" style="margin-top:14px;font-size:12px;color:#6b6b67"></p>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="js/oidc.js"></script>
+  <script>
+    const oidc = new OidcClient(window.AUTHCORE_OIDC_CONFIG);
+    if (new URLSearchParams(location.search).get('reason') === 'revoked') {
+      document.getElementById('revoked-notice').style.display = 'block';
+    }
+    document.getElementById('signin').addEventListener('click', () => oidc.signIn());
+    // 如果已经有 access_token，直接进 dashboard
+    if (oidc.getAccessToken()) {
+      document.getElementById('hint').textContent = '检测到已登录，2 秒后跳转...';
+      setTimeout(() => location.href = 'dashboard.html', 2000);
+    }
+  </script>
+</body>
+</html>

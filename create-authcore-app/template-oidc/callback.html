@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>处理登录 · AuthCore</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1 id="title">处理登录中...</h1>
+      <p class="subtitle" id="msg">正在与 AuthCore 交换 token</p>
+      <pre id="err" class="result-box show" style="display:none;color:#e05a5a;"></pre>
+    </div>
+  </div>
+  <script src="config.js"></script>
+  <script src="js/oidc.js"></script>
+  <script>
+    (async () => {
+      const oidc = new OidcClient(window.AUTHCORE_OIDC_CONFIG);
+      try {
+        const r = await oidc.handleCallback();
+        // 存 access_token（不是 id_token！）—— 后端 /oauth/userinfo 验证的是 access_token
+        localStorage.setItem('auth_token', r.accessToken);
+        localStorage.setItem('auth_user', JSON.stringify(r.user));
+        if (r.refreshToken) localStorage.setItem('refresh_token', r.refreshToken);
+        // 标记登录方式为 OIDC——前端刷新/后端鉴权需要据此选择端点
+        localStorage.setItem('login_method', 'oidc');
+        localStorage.setItem('oidc_client_id', window.AUTHCORE_OIDC_CONFIG.clientId);
+        localStorage.setItem('oidc_issuer', window.AUTHCORE_OIDC_CONFIG.issuer);
+        document.getElementById('title').textContent = '登录成功';
+        document.getElementById('msg').textContent = '欢迎 ' + (r.user.name || r.user.email);
+        setTimeout(function() { location.href = 'dashboard.html'; }, 800);
+      } catch (e) {
+        document.getElementById('title').textContent = '登录失败';
+        document.getElementById('msg').textContent = e.message;
+        const errEl = document.getElementById('err');
+        errEl.style.display = 'block';
+        errEl.textContent = String(e.stack || e);
+      }
+    })();
+  </script>
+</body>
+</html>

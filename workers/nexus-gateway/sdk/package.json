@@ -1,0 +1,48 @@
+{
+  "name": "nexus-auth-sdk",
+  "version": "5.9.0",
+  "description": "AuthCore — 认证即服务 SDK：API Key 密码注册 + OpenID Connect 跨应用 SSO。",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js", "index.mjs", "index.d.ts",
+    "react.js", "react.d.ts",
+    "oidc.js", "oidc.d.ts",
+    "oidc-react.js", "oidc-react.d.ts",
+    "_telemetry.js", "_telemetry.mjs",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "import": "./index.mjs",
+      "require": "./index.js",
+      "default": "./index.js"
+    },
+    "./react": {
+      "types": "./react.d.ts",
+      "import": "./react.js",
+      "require": "./react.js",
+      "default": "./react.js"
+    },
+    "./oidc": {
+      "types": "./oidc.d.ts",
+      "import": "./oidc.js",
+      "require": "./oidc.js",
+      "default": "./oidc.js"
+    },
+    "./oidc-react": {
+      "types": "./oidc-react.d.ts",
+      "import": "./oidc-react.js",
+      "require": "./oidc-react.js",
+      "default": "./oidc-react.js"
+    }
+  },
+  "keywords": ["auth", "authentication", "jwt", "oidc", "openid", "sso", "authcore", "login", "register"],
+  "license": "MIT",
+  "peerDependencies": {
+    "react": ">=17"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true }
+  }
+}

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>正在登录...</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>正在完成登录...</h1>
+      <p class="subtitle" id="status">请稍候</p>
+    </div>
+  </div>
+  <script src="/js/app.js"></script>
+  <script>
+    // OIDC 回调：后端把 token / user 通过 URL 参数透传过来，前端写入 localStorage 再跳 dashboard
+    const p = new URLSearchParams(location.search);
+    const token = p.get('access_token');
+    const refresh = p.get('refresh_token');
+    const userId = p.get('user_id');
+    const email = p.get('email');
+    const username = p.get('username') || (email || '').split('@')[0];
+    const clientId = p.get('client_id');
+
+    if (!token || !email) {
+      document.getElementById('status').textContent = '回调参数缺失，请重试';
+      setTimeout(() => location.replace('/'), 2000);
+    } else {
+      saveToken(token);
+      saveUser({ id: userId, email, username });
+      if (refresh) saveRefreshToken(refresh);
+      localStorage.setItem('login_method', 'oidc');
+      if (clientId) localStorage.setItem('oidc_client_id', clientId);
+      location.replace('/dashboard.html');
+    }
+  </script>
+</body>
+</html>
