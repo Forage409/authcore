@@ -10,7 +10,9 @@
 [![License](https://img.shields.io/github/license/Forage409/authcore.svg?color=1a1a1a)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/Forage409/authcore.svg?style=social)](https://github.com/Forage409/authcore/stargazers)
 
-[**线上演示**](https://auth.miaogou.site) · [**npm 包**](https://www.npmjs.com/package/nexus-auth-sdk) · [**脚手架**](https://www.npmjs.com/package/create-nexus-auth)
+[**▶ 在线 Playground**](https://nexus-playground.pages.dev) · [**控制台**](https://auth.miaogou.site) · [**npm 包**](https://www.npmjs.com/package/nexus-auth-sdk) · [**脚手架**](https://www.npmjs.com/package/create-nexus-auth)
+
+无需注册账号，[**点这里**](https://nexus-playground.pages.dev) 5 分钟亲手玩一遍：注册 → 登录 → OIDC SSO → 封禁演示
 
 </div>
 

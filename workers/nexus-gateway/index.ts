@@ -37,8 +37,32 @@ app.use('/api/abuse/report', cors({
   maxAge: 86400,
 }));
 
+// playground.miaogou.site 演示用 — 封禁自己 / 解除自己（只对 playground-* 演示账号生效）
+app.use('/api/demo/*', cors({
+  origin: '*',
+  allowMethods: ['POST', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'X-API-Key'],
+  maxAge: 86400,
+}));
+
 // 控制台 API + 授权页内部接口 — 严格同源（带 SSO Cookie）
-app.use('/api/*', cors({ origin: ['https://auth.miaogou.site', 'https://miaogou.site', 'https://nexus-gateway.pages.dev'], credentials: true }));
+app.use('/api/*', cors({
+  origin: (origin) => {
+    // 允许：平台自有域名 + playground 子域 + CF Pages 预览域 + 本地 dev 端口
+    if (!origin) return null;
+    if (origin === 'https://auth.miaogou.site') return origin;
+    if (origin === 'https://miaogou.site') return origin;
+    if (origin === 'https://playground.miaogou.site') return origin;
+    if (origin === 'https://nexus-gateway.pages.dev') return origin;
+    if (origin === 'https://nexus-playground.pages.dev') return origin;
+    // CF Pages 预览域：<hash>.nexus-playground.pages.dev / <hash>.nexus-gateway.pages.dev
+    if (/^https:\/\/[a-z0-9]+\.nexus-(playground|gateway)\.pages\.dev$/.test(origin)) return origin;
+    // 本地 dev 端口
+    if (/^http:\/\/localhost:(517[0-9]|518[0-9])$/.test(origin)) return origin;
+    return null;
+  },
+  credentials: true,
+}));
 app.use('/oauth/authorize/*', cors({ origin: ['https://auth.miaogou.site', 'https://user.miaogou.site', 'https://miaogou.site'], credentials: true }));
 app.use('/oauth/sso/*', cors({ origin: ['https://auth.miaogou.site', 'https://user.miaogou.site', 'https://miaogou.site'], credentials: true }));
 
@@ -341,6 +365,7 @@ async function dnsLookup(domain: string): Promise<{ a: string[]; aaaa: string[] 
 // 信任的托管域名后缀：在这些平台上托管 SPA 等于平台自己背书，黑客滥用成本极高
 // 加新的请联系运维 —— 不要随意扩展（每加一项都是攻击面）
 const TRUSTED_HOSTING_SUFFIXES = [
+  // CDN / 静态托管
   '.github.io',
   '.vercel.app',
   '.netlify.app',
@@ -349,11 +374,46 @@ const TRUSTED_HOSTING_SUFFIXES = [
   '.web.app',             // Firebase Hosting
   '.firebaseapp.com',
   '.cloudflareaccess.com',
+  // 主流 PaaS / 边缘运行时
+  '.deno.dev',            // Deno Deploy
+  '.fly.dev',             // Fly.io
+  '.railway.app',         // Railway
+  '.onrender.com',        // Render
+  '.amplifyapp.com',      // AWS Amplify
+  '.appspot.com',         // Google App Engine
+  '.run.app',             // Google Cloud Run
+  '.azurestaticapps.net', // Azure Static Web Apps
+  '.azurewebsites.net',   // Azure App Service
+  '.herokuapp.com',       // Heroku
+  '.replit.app',          // Replit
+  '.surge.sh',            // Surge
+  '.glitch.me',           // Glitch
+  // dev / 测试域名（RFC 6761 / 2606 保留）
+  '.localhost',           // 所有 *.localhost 按 RFC 6761 必须解析到 loopback
+  '.local',               // mDNS / Bonjour
+  '.test',                // RFC 2606 测试域名
+  '.invalid',             // RFC 2606
+  '.example',             // RFC 2606
 ];
+
+// IPv4 字符串是否属于私网（RFC 1918）/ loopback / 0.0.0.0
+function isPrivateIPv4(host: string): boolean {
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return false;
+  const [a, b] = [parseInt(m[1]), parseInt(m[2])];
+  if (a > 255 || b > 255 || parseInt(m[3]) > 255 || parseInt(m[4]) > 255) return false;
+  if (a === 127 || a === 0) return true;                           // loopback / unspecified
+  if (a === 10) return true;                                       // 10/8
+  if (a === 192 && b === 168) return true;                         // 192.168/16
+  if (a === 172 && b >= 16 && b <= 31) return true;                // 172.16/12
+  return false;
+}
 
 function isTrustedHostingDomain(host: string): boolean {
   const h = host.toLowerCase();
-  if (h === 'localhost' || h === '127.0.0.1') return true;
+  // dev hosts: localhost / IPv6 loopback / 私网 IP / 保留域名
+  if (h === 'localhost' || h === '[::1]' || h === '::1') return true;
+  if (isPrivateIPv4(h)) return true;
   for (const suf of TRUSTED_HOSTING_SUFFIXES) {
     // 必须真子域名（防 evil-github.io.attacker.com 这种伪装）
     if (h.endsWith(suf) && h.length > suf.length) return true;
@@ -361,7 +421,30 @@ function isTrustedHostingDomain(host: string): boolean {
   return false;
 }
 
-// 评估应用审批状态：考虑 [信任托管 + 已 DNS 验证] 两类豁免
+// 检查某 host 是否已被该 user 验证；自动继承父域验证（已验 miaogou.site → 任意子域名直接通过）
+// 不查 1-label TLD（如 site / com），因为没人能给 TLD 加 TXT 也没有意义
+// 返回 { verified: bool, coveredBy: string|null }：coveredBy 是触发通过的真正域名（精确或父域）
+async function isHostVerified(db: any, userId: string, host: string): Promise<{ verified: boolean; coveredBy: string | null }> {
+  const labels = host.split('.');
+  // 候选：精确 host，然后逐级去掉最前面的 label，直到剩 2 个 label 为止
+  const candidates: string[] = [];
+  for (let i = 0; i < labels.length - 1; i++) {
+    const candidate = labels.slice(i).join('.');
+    if (candidate.split('.').length >= 2) candidates.push(candidate);
+  }
+  if (candidates.length === 0) return { verified: false, coveredBy: null };
+  // 一次性查所有候选，DB 一次 IN 查询
+  const placeholders = candidates.map(() => '?').join(',');
+  const { results } = await db.prepare(
+    `SELECT domain FROM domain_verifications WHERE user_id = ? AND verified = 1 AND domain IN (${placeholders})`
+  ).bind(userId, ...candidates).all();
+  if (!results || results.length === 0) return { verified: false, coveredBy: null };
+  // 精确匹配优先；否则取第一个父域（其实任一父域命中就够了）
+  const exact = results.find((r: any) => r.domain === host);
+  return { verified: true, coveredBy: exact ? host : (results[0] as any).domain };
+}
+
+// 评估应用审批状态：考虑 [信任托管 + 已 DNS 验证（含父域继承）] 两类豁免
 // approved 条件：OIDC 关 / 没 URI / 所有 URI 域名都满足任一豁免
 // 否则 pending（沙盒，仅所有者可登录）
 async function evaluateApprovalStatus(db: any, userId: string, oidcEnabled: boolean, redirectUris: string): Promise<'approved' | 'pending'> {
@@ -372,11 +455,8 @@ async function evaluateApprovalStatus(db: any, userId: string, oidcEnabled: bool
     let host = '';
     try { host = new URL(u).hostname.toLowerCase(); } catch { return 'pending'; }
     if (isTrustedHostingDomain(host)) continue;
-    // 查 domain_verifications：该开发者是否已验证此域名
-    const r = await db.prepare(
-      `SELECT verified FROM domain_verifications WHERE user_id = ? AND domain = ?`
-    ).bind(userId, host).first() as any;
-    if (!r || !r.verified) return 'pending';
+    const { verified } = await isHostVerified(db, userId, host);
+    if (!verified) return 'pending';
   }
   return 'approved';
 }
@@ -1357,6 +1437,24 @@ app.get('/api/gateway/metrics', authMW, async (c) => {
   const keys = await c.env.DB.prepare('SELECT COUNT(*) as c FROM api_keys WHERE user_id = ? AND revoked = 0').bind(uid).first() as any;
   const users = await c.env.DB.prepare('SELECT COUNT(*) as c FROM gateway_users WHERE created_by = ?').bind(uid).first() as any;
   return c.json({ activeKeys: keys?.c || 0, totalUsers: users?.c || 0 });
+});
+
+// ══════ Me: 当前开发者所有已验证域名 + 信任托管平台列表（前端 redirect URI 预览用） ══════
+// 给"实时预览每条 redirect URI 状态"功能用：开发者在 textarea 输入时无需点保存就能看到每行是
+//   - 自动通过（信任托管 / dev host）
+//   - 覆盖通过（已验证父域）
+//   - 需要 DNS 验证
+//   - 非法
+// 前端拿到 verified_domains（用户名下所有 verified=1）+ trusted_suffixes，就能纯本地实时判断
+app.get('/api/me/verified-domains', authMW, async (c) => {
+  const uid = (c as any).get('userId') as string;
+  const { results } = await c.env.DB.prepare(
+    'SELECT domain FROM domain_verifications WHERE user_id = ? AND verified = 1'
+  ).bind(uid).all();
+  return c.json({
+    verified_domains: (results as any[]).map(r => r.domain),
+    trusted_suffixes: TRUSTED_HOSTING_SUFFIXES,
+  });
 });
 
 // ══════ Clients CRUD ══════
@@ -2565,7 +2663,22 @@ app.get('/api/clients/:id/verification', authMW, async (c) => {
   const domains = extractDomainsNeedingVerification(row.redirect_uris || '');
   const out: any[] = [];
   for (const domain of domains) {
-    // 取已有 challenge，没有就懒生成一条（不立即返回，等下次 list 拿到完整列表）
+    // 优先检查父域继承：已验 miaogou.site → playground.miaogou.site 直接通过，不再要求新 TXT
+    const inherit = await isHostVerified(c.env.DB, uid, domain);
+    if (inherit.verified && inherit.coveredBy && inherit.coveredBy !== domain) {
+      out.push({
+        domain,
+        verified: true,
+        covered_by: inherit.coveredBy,
+        verified_at: null,
+        last_check_at: null,
+        last_check_error: null,
+        // 不返回 dns_record——子域名无需添加新 TXT
+        dns_record: null,
+      });
+      continue;
+    }
+    // 取已有 challenge，没有就懒生成一条
     let v = await c.env.DB.prepare(
       'SELECT challenge, verified, verified_at, last_check_at, last_check_error FROM domain_verifications WHERE user_id = ? AND domain = ?'
     ).bind(uid, domain).first() as any;
@@ -2580,6 +2693,7 @@ app.get('/api/clients/:id/verification', authMW, async (c) => {
     out.push({
       domain,
       verified: !!v.verified,
+      covered_by: null,
       verified_at: v.verified_at,
       last_check_at: v.last_check_at,
       last_check_error: v.last_check_error,
@@ -2591,9 +2705,19 @@ app.get('/api/clients/:id/verification', authMW, async (c) => {
       },
     });
   }
+  // 如果列表里出现了任意「父域覆盖」的子域名，触发一次应用状态重评（可能从 pending → approved）
+  // 让用户无需点 check 按钮也能直接看到应用已批准的状态
+  let reviewStatus = row.app_review_status;
+  const anyCovered = out.some(d => d.covered_by);
+  if (anyCovered && reviewStatus !== 'rejected') {
+    reviewStatus = await evaluateApprovalStatus(c.env.DB, uid, !!row.oidc_enabled, row.redirect_uris || '');
+    if (reviewStatus !== row.app_review_status) {
+      await c.env.DB.prepare('UPDATE api_keys SET app_review_status = ? WHERE id = ? AND user_id = ?').bind(reviewStatus, pid, uid).run();
+    }
+  }
   return c.json({
     domains: out,
-    review_status: row.app_review_status,
+    review_status: reviewStatus,
     oidc_enabled: !!row.oidc_enabled,
   });
 });
@@ -2619,6 +2743,26 @@ app.post('/api/clients/:id/verification/:domain/check', authMW, async (c) => {
   if (!app2) return err(c, 'not_found', '应用不存在', 404);
   const needed = extractDomainsNeedingVerification(app2.redirect_uris || '');
   if (!needed.includes(domain)) return err(c, 'domain_not_in_app', '该域名不属于此应用的 redirect URI', 400);
+
+  // 父域继承：开发者已验证父域（如 miaogou.site）时，子域名（playground.miaogou.site）
+  // 不需要再加 TXT，直接当作已验证处理。返回 status，附带 coveredBy 让前端展示来源
+  const inherit = await isHostVerified(c.env.DB, uid, domain);
+  if (inherit.verified && inherit.coveredBy && inherit.coveredBy !== domain) {
+    const cur = await c.env.DB.prepare(
+      'SELECT oidc_enabled, redirect_uris, app_review_status FROM api_keys WHERE id = ? AND user_id = ?'
+    ).bind(pid, uid).first() as any;
+    let newStatus: string | undefined;
+    if (cur && cur.app_review_status !== 'rejected') {
+      newStatus = await evaluateApprovalStatus(c.env.DB, uid, !!cur.oidc_enabled, cur.redirect_uris || '');
+      await c.env.DB.prepare('UPDATE api_keys SET app_review_status = ? WHERE id = ? AND user_id = ?').bind(newStatus, pid, uid).run();
+    }
+    return c.json({
+      verified: true,
+      covered_by: inherit.coveredBy,
+      review_status: newStatus,
+      message: `该子域名已被你已验证的父域 ${inherit.coveredBy} 自动覆盖，无需再加 TXT` + (newStatus === 'approved' ? '。应用已自动批准' : ''),
+    });
+  }
 
   // 拿 challenge
   const v = await c.env.DB.prepare(
@@ -2962,6 +3106,53 @@ app.get('/api/admin/bans/audit', authMW, async (c) => {
 //   - description 字段限长 2000，category 必须在白名单
 const ABUSE_CATEGORIES = new Set(['illegal','porn','gambling','phishing','csam','malware','copyright','harassment','spam','other']);
 const ABUSE_TARGET_TYPES = new Set(['api_key','oidc_app','user_email','content_url','other']);
+
+// ══════ Playground Demo Only — 演示账号自我封禁 / 解封 ══════
+// 安全约束：
+//   - 只对 playground-*@example.com 模式的邮箱生效（gateway_users 表的演示账号）
+//   - 必须带 Demo API Key (X-API-Key) 防被滥用
+//   - 限流：同 email 60s 内最多 5 次（防恶意刷 ban_audit_log）
+//   - 不写 ban_audit_log（这是演示，不是真实合规事件）
+function isDemoEmail(email: string): boolean {
+  return typeof email === 'string' && /^playground-[a-z0-9]{6,}@example\.com$/i.test(email);
+}
+
+app.post('/api/demo/ban-me', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const email = String(body.email || '').toLowerCase().trim();
+  if (!email || !isDemoEmail(email)) {
+    return err(c, 'not_demo_account', '此端点仅对 Playground 演示账号生效（playground-*@example.com）', 400);
+  }
+  if (await rateLimit(c, 'demo:ban:' + email, 60, 5)) return err(c, 'rate_limited', '操作过于频繁', 429);
+  // 同时打三张身份表的 banned 列；现实里通过 admin/bans 端点统一处理，演示直接同步打
+  const ts = `datetime('now', '+8 hours')`;
+  await c.env.DB.prepare(
+    `UPDATE gateway_users SET banned = 1, banned_at = ${ts}, banned_reason = 'Playground 演示封禁（用户自助触发）' WHERE email = ?`
+  ).bind(email).run();
+  await c.env.DB.prepare(
+    `UPDATE users SET banned = 1, banned_at = ${ts}, banned_reason = 'Playground 演示封禁（用户自助触发）' WHERE email = ?`
+  ).bind(email).run();
+  await c.env.DB.prepare(
+    `UPDATE oidc_identities SET banned = 1, banned_at = ${ts}, banned_reason = 'Playground 演示封禁（用户自助触发）' WHERE email = ?`
+  ).bind(email).run();
+  // 撤销所有活跃 refresh token / oidc grant，让封禁瞬时生效（与正式 admin/bans 同样的副作用）
+  await c.env.DB.prepare(`DELETE FROM refresh_tokens WHERE user_id IN (SELECT id FROM gateway_users WHERE email = ?)`).bind(email).run().catch(() => {});
+  await c.env.DB.prepare(`DELETE FROM refresh_tokens WHERE user_id IN (SELECT id FROM users WHERE email = ?)`).bind(email).run().catch(() => {});
+  return c.json({ success: true, message: '演示账号已封禁，下次 verify 会立即返回 AccountBannedError' });
+});
+
+app.post('/api/demo/unban-me', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const email = String(body.email || '').toLowerCase().trim();
+  if (!email || !isDemoEmail(email)) {
+    return err(c, 'not_demo_account', '此端点仅对 Playground 演示账号生效', 400);
+  }
+  if (await rateLimit(c, 'demo:unban:' + email, 60, 5)) return err(c, 'rate_limited', '操作过于频繁', 429);
+  await c.env.DB.prepare(`UPDATE gateway_users SET banned = 0, banned_at = NULL, banned_reason = NULL WHERE email = ?`).bind(email).run();
+  await c.env.DB.prepare(`UPDATE users SET banned = 0, banned_at = NULL, banned_reason = NULL WHERE email = ?`).bind(email).run();
+  await c.env.DB.prepare(`UPDATE oidc_identities SET banned = 0, banned_at = NULL, banned_reason = NULL WHERE email = ?`).bind(email).run();
+  return c.json({ success: true });
+});
 
 app.post('/api/abuse/report', async (c) => {
   // 多维度限流（IP）+ 全局限流（防整体淹没）
