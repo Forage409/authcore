@@ -1,8 +1,62 @@
+<div align="center">
+
 # AuthCore
 
-跑在 Cloudflare Workers 上的认证即服务（Auth-as-a-Service）后端。开发者注册后拿到 API Key，即可用一套 SDK 给自家应用接上密码注册 / 登录 + OpenID Connect 跨应用 SSO。
+**跑在 Cloudflare Workers 上的开源认证即服务**
+密码注册 / 登录 · OpenID Connect 跨应用 SSO · 中文文档 · 一行脚手架接入
 
-线上：**https://auth.miaogou.site**
+[![npm version](https://img.shields.io/npm/v/nexus-auth-sdk.svg?color=1a1a1a)](https://www.npmjs.com/package/nexus-auth-sdk)
+[![npm downloads](https://img.shields.io/npm/dm/nexus-auth-sdk.svg?color=1a1a1a)](https://www.npmjs.com/package/nexus-auth-sdk)
+[![License](https://img.shields.io/github/license/Forage409/authcore.svg?color=1a1a1a)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/Forage409/authcore.svg?style=social)](https://github.com/Forage409/authcore/stargazers)
+
+[**线上演示**](https://auth.miaogou.site) · [**npm 包**](https://www.npmjs.com/package/nexus-auth-sdk) · [**脚手架**](https://www.npmjs.com/package/create-nexus-auth)
+
+</div>
+
+---
+
+## 截图
+
+<p align="center">
+  <img src=".github/screenshots/console.png" alt="开发者控制台" width="80%" />
+  <br/><em>开发者控制台 — API Key / OIDC 应用 / Webhook / 封禁管理</em>
+</p>
+
+<p align="center">
+  <img src=".github/screenshots/oidc-authorize.png" alt="OIDC 授权页" width="60%" />
+  <br/><em>Google 风格 OIDC 授权页</em>
+</p>
+
+## 30 秒接入
+
+```bash
+npx create-nexus-auth my-app   # 一行脚手架，自动生成接入代码
+cd my-app && npm install && npm run dev
+```
+
+或者直接 SDK：
+
+```ts
+import { AuthCore } from 'nexus-auth-sdk';
+
+const auth = new AuthCore({ apiKey: 'nx_xxx' });
+
+await auth.register({ email, password });           // 注册
+const { token, user } = await auth.login({ email, password });  // 登录
+const verified = await auth.verify(token);          // 校验
+```
+
+## 为什么选 AuthCore
+
+|  | AuthCore | Auth0 | Clerk | 自己造 |
+|---|---|---|---|---|
+| 部署 | CF Workers 5 分钟 | 闭源 SaaS | 闭源 SaaS | 几周到几月 |
+| 价格 | **免费**（自部署）| $25/mo 起 | $25/mo 起 | 工时成本 |
+| OIDC SSO | ✓ | ✓ | ✓ | 自己写 |
+| 中文文档 / 合规 | ✓ | ✗ | ✗ | — |
+| 14 天注销 / 举报 / 封禁审计 | ✓ | 部分 | 部分 | 自己写 |
+| 源码可改 | MIT 全开源 | ✗ | ✗ | 你的代码 |
 
 ## 仓库内容
 
