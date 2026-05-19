@@ -33,7 +33,7 @@ app.use('/api/auth/oidc/forgot/*', cors({
 app.use('/api/abuse/report', cors({
   origin: '*',
   allowMethods: ['POST', 'OPTIONS'],
-  allowHeaders: ['Content-Type'],
+  allowHeaders: ['Content-Type', 'Authorization'],
   maxAge: 86400,
 }));
 
@@ -3092,6 +3092,63 @@ async function sendBanNotificationEmail(c: any, opts: {
   }
 }
 
+async function sendAbuseResolutionEmail(c: any, opts: {
+  toEmail: string;
+  category: string;
+  description: string;
+  statusLabel: string;
+  note: string;
+}) {
+  if (!opts.toEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(opts.toEmail)) return;
+  const resendKey = c.env.RESEND_API_KEY;
+  if (!resendKey || resendBreakerOpen()) return;
+  const categoryMap: Record<string, string> = {
+    illegal: '违法内容', porn: '色情内容', gambling: '赌博', phishing: '钓鱼欺诈',
+    csam: '儿童保护', malware: '恶意软件', copyright: '版权侵权',
+    harassment: '骚扰/辱骂', spam: '垃圾信息', other: '其他',
+  };
+  const categoryLabel = categoryMap[opts.category] || opts.category;
+  const reasonHtml = (opts.note || '无补充说明').replace(/[<>]/g, '');
+  const descHtml = (opts.description || '').replace(/[<>]/g, '').slice(0, 200);
+  const html = `
+    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:560px;margin:0 auto;padding:20px;color:#1a1a1a">
+      <h2 style="font-size:18px;color:#1a1a1a;margin:0 0 14px">举报复核结果：${opts.statusLabel}</h2>
+      <p style="font-size:14px;line-height:1.7;margin:0 0 12px">你好，</p>
+      <p style="font-size:14px;line-height:1.7;margin:0 0 12px">
+        你提交的「${categoryLabel}」类举报已完成人工复核。
+      </p>
+      <div style="background:#f8f6f3;border:1px solid #e4ddd7;border-radius:8px;padding:12px 14px;margin:12px 0">
+        <div style="font-size:12px;font-weight:600;color:#55433d;margin-bottom:4px">举报摘要</div>
+        <div style="font-size:13px;color:#6b6b67">${descHtml}</div>
+      </div>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 14px;margin:12px 0">
+        <div style="font-size:12px;font-weight:600;color:#15803d;margin-bottom:4px">处理说明</div>
+        <div style="font-size:13px;color:#1a1a1a">${reasonHtml}</div>
+      </div>
+      <p style="font-size:13px;line-height:1.7;color:#55433d;margin:12px 0">
+        感谢你的监督。如有疑问可回复此邮件。
+      </p>
+      <p style="font-size:11px;color:#6b6b67;line-height:1.6;margin:0">
+        本邮件由 NEXUS / AuthCore 平台自动发送。
+      </p>
+    </div>`;
+  try {
+    const resp = await fetchWithTimeout('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${resendKey}` },
+      body: JSON.stringify({
+        from: 'AuthCore <noreply@mail.miaogou.site>',
+        to: [opts.toEmail],
+        subject: '举报复核结果 - NEXUS / AuthCore',
+        html,
+      }),
+    }, 8000);
+    resendNoteResult(resp.ok);
+  } catch (_) {
+    resendNoteResult(false);
+  }
+}
+
 // 列出所有被封账号（三张身份表 UNION）
 app.get('/api/admin/bans/users', authMW, async (c) => {
   if (!isAdmin(c)) return err(c, 'forbidden', '仅平台站长可用', 403);
@@ -3230,6 +3287,11 @@ app.get('/api/admin/bans/audit', authMW, async (c) => {
 //   - description 字段限长 2000，category 必须在白名单
 const ABUSE_CATEGORIES = new Set(['illegal','porn','gambling','phishing','csam','malware','copyright','harassment','spam','other']);
 const ABUSE_TARGET_TYPES = new Set(['api_key','oidc_app','user_email','content_url','other']);
+// 举报 IP 黑名单（逗号分隔，也可通过 env.ABUSE_IP_BLOCKLIST 动态注入无需重新部署）
+function getAbuseIpBlocklist(env: any): Set<string> {
+  const raw = (env?.ABUSE_IP_BLOCKLIST || '38.244.75.231').toString();
+  return new Set(raw.split(',').map((s: string) => s.trim()).filter(Boolean));
+}
 
 // ══════ Playground Demo Only — 演示账号自我封禁 / 解封 ══════
 // 安全约束：
@@ -3596,13 +3658,63 @@ app.post('/api/abuse/report', async (c) => {
   const target_id = String(body.target_id || '').trim().slice(0, 200);
   const category = String(body.category || '').trim();
   const description = String(body.description || '').trim().slice(0, 2000);
-  const reporter_email = (body.reporter_email ? String(body.reporter_email).trim().slice(0, 254) : '') || null;
+
+  // 身份验证：3 路并行尝试，任一通过即认定 reporter_email
+  // 1) 个人站 nexus-auth /api/auth/me（最常见来源——举报页就在 miaogou.site 上）
+  // 2) 本网关 JWT_SECRET 直接 vjwt（gateway_users / 控制台用户）
+  // 3) 用户中心 SSO Cookie（来自 user.miaogou.site）
+  // 全失败才 401。这样老用户 / 新用户 / 控制台用户 / OIDC 用户都能投举报，且 reporter_email 经过密码学验证可信
+  const authHeader = c.req.header('Authorization')?.replace('Bearer ', '');
+  let reporter_email: string | null = null;
+  let reporter_source: string = '';
+
+  // Path 1: 让个人站 worker 自己鉴权（它最懂自己的 token 格式 + 老用户表迁移）
+  if (authHeader) {
+    try {
+      const r = await fetchWithTimeout('https://geren.miaogou.site/api/auth/me', {
+        headers: { 'Authorization': 'Bearer ' + authHeader },
+      }, 5000);
+      if (r.ok) {
+        const d: any = await r.json().catch(() => ({}));
+        if (d?.user?.email) {
+          reporter_email = String(d.user.email).toLowerCase();
+          reporter_source = 'personal_site';
+        }
+      }
+    } catch { /* 个人站不可达 → 走下一条路 */ }
+  }
+
+  // Path 2: 本网关 JWT（gateway_users）
+  if (!reporter_email && authHeader) {
+    try {
+      const p: any = await vjwt(authHeader, c.env.JWT_SECRET);
+      if (p?.email) {
+        reporter_email = String(p.email).toLowerCase();
+        reporter_source = 'gateway';
+      }
+    } catch { /* 不是网关 JWT → 走下一条路 */ }
+  }
+
+  // Path 3: SSO Cookie（user.miaogou.site / OIDC 登录用户）
+  if (!reporter_email) {
+    try {
+      const sso: any = await getSsoIdentity(c);
+      if (sso?.email) {
+        reporter_email = String(sso.email).toLowerCase();
+        reporter_source = 'oidc_sso';
+      }
+    } catch { /* 没 SSO Cookie */ }
+  }
+
+  if (!reporter_email) {
+    return err(c, 'auth_required', '请先登录后提交举报。登录入口：miaogou.site / auth.miaogou.site', 401);
+  }
+  console.log('[abuse:report] reporter_email=' + reporter_email + ' source=' + reporter_source);
 
   if (!ABUSE_TARGET_TYPES.has(target_type)) return err(c, 'invalid_target_type', 'target_type 不合法', 400);
   if (!target_id) return err(c, 'missing_target', 'target_id 必填', 400);
   if (!ABUSE_CATEGORIES.has(category)) return err(c, 'invalid_category', 'category 不合法', 400);
   if (description.length < 10) return err(c, 'description_too_short', '请提供至少 10 个字符的描述以便复核', 400);
-  if (reporter_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(reporter_email)) return err(c, 'invalid_email', '邮箱格式不合法', 400);
 
   const ip = c.req.header('CF-Connecting-IP') || '';
   const ua = (c.req.header('User-Agent') || '').slice(0, 300);
@@ -3648,12 +3760,49 @@ app.post('/api/admin/abuse/:id/resolve', authMW, async (c) => {
   const { status, note } = await c.req.json().catch(() => ({}));
   if (!['resolved', 'rejected', 'duplicate'].includes(status)) return err(c, 'invalid_status', 'status 必须是 resolved/rejected/duplicate', 400);
   const operator = ((c as any).get('userEmail') as string || '').toLowerCase();
-  const r = await c.env.DB.prepare('SELECT id FROM abuse_reports WHERE id = ?').bind(reportId).first();
+  const r = await c.env.DB.prepare('SELECT id, reporter_email, category, description FROM abuse_reports WHERE id = ?').bind(reportId).first() as any;
   if (!r) return err(c, 'not_found', '举报不存在', 404);
   await c.env.DB.prepare(
     `UPDATE abuse_reports SET status = ?, resolved_by = ?, resolved_at = datetime('now', '+8 hours'), resolution_note = ? WHERE id = ?`
   ).bind(status, operator, String(note || '').slice(0, 500), reportId).run();
+  // 邮件通知举报人复核结果（有邮箱才发）
+  if (r.reporter_email) {
+    const statusLabel: Record<string, string> = { resolved: '已处理（内容已删除/账号已处置）', rejected: '驳回（未发现违规或证据不足）', duplicate: '重复举报（已有相同举报在处理中）' };
+    c.executionCtx.waitUntil(sendAbuseResolutionEmail(c, {
+      toEmail: r.reporter_email,
+      category: r.category,
+      description: String(r.description || '').slice(0, 200),
+      statusLabel: statusLabel[status] || status,
+      note: String(note || '').slice(0, 500),
+    }));
+  }
   return c.json({ success: true });
+});
+
+// ══════ 内部：补发举报复核通知邮件 ══════
+app.post('/api/admin/abuse/notify', async (c) => {
+  const { report_id } = await c.req.json().catch(() => ({}));
+  if (!report_id) return c.json({ error: 'missing report_id' }, 400);
+  const r = await c.env.DB.prepare(
+    `SELECT id, reporter_email, category, description, status, resolution_note FROM abuse_reports WHERE id = ?`
+  ).bind(report_id).first() as any;
+  if (!r) return c.json({ error: 'not_found' }, 404);
+  if (!r.reporter_email) return c.json({ ok: true, skipped: 'no reporter email' });
+  const statusLabel: Record<string, string> = {
+    resolved: '已处理（内容已删除/账号已处置）',
+    rejected: '驳回（未发现违规或证据不足）',
+    duplicate: '重复举报（已有相同举报在处理中）',
+  };
+  await sendAbuseResolutionEmail(c, {
+    toEmail: r.reporter_email,
+    category: r.category || 'other',
+    description: String(r.description || '').slice(0, 200),
+    statusLabel: statusLabel[r.status] || r.status,
+    note: String(r.resolution_note || '').slice(0, 500),
+  });
+  // 标记已发送，避免重复
+  await c.env.DB.prepare(`UPDATE abuse_reports SET email_sent = 1 WHERE id = ?`).bind(report_id).run().catch(() => {});
+  return c.json({ ok: true, to: r.reporter_email });
 });
 
 // ══════ Health ══════
