@@ -3092,16 +3092,43 @@ async function sendBanNotificationEmail(c: any, opts: {
   }
 }
 
+// 持久化邮件投递结果到 abuse_reports，让站长 UI 能显示"邮件已发 / 发失败 / 跳过"
+async function persistAbuseEmailResult(c: any, reportId: string, status: 'sent' | 'failed' | 'no_email' | 'skipped_breaker', err?: string) {
+  if (!reportId) return;
+  try {
+    if (status === 'sent') {
+      await c.env.DB.prepare(
+        `UPDATE abuse_reports SET email_status = 'sent', email_sent_at = datetime('now', '+8 hours'), email_last_error = NULL, email_retry_count = email_retry_count + 1 WHERE id = ?`
+      ).bind(reportId).run();
+    } else {
+      await c.env.DB.prepare(
+        `UPDATE abuse_reports SET email_status = ?, email_last_error = ?, email_retry_count = email_retry_count + 1 WHERE id = ?`
+      ).bind(status, (err || '').slice(0, 500), reportId).run();
+    }
+  } catch (e) { console.error('[abuse:email_persist]', e); }
+}
+
 async function sendAbuseResolutionEmail(c: any, opts: {
+  reportId?: string;     // 用于持久化投递结果
   toEmail: string;
   category: string;
   description: string;
   statusLabel: string;
   note: string;
 }) {
-  if (!opts.toEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(opts.toEmail)) return;
+  if (!opts.toEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(opts.toEmail)) {
+    await persistAbuseEmailResult(c, opts.reportId!, 'no_email', '邮箱格式不合法或为空');
+    return;
+  }
   const resendKey = c.env.RESEND_API_KEY;
-  if (!resendKey || resendBreakerOpen()) return;
+  if (!resendKey) {
+    await persistAbuseEmailResult(c, opts.reportId!, 'failed', 'RESEND_API_KEY 未配置');
+    return;
+  }
+  if (resendBreakerOpen()) {
+    await persistAbuseEmailResult(c, opts.reportId!, 'skipped_breaker', 'Resend 熔断器开启，今日邮件配额已用完');
+    return;
+  }
   const categoryMap: Record<string, string> = {
     illegal: '违法内容', porn: '色情内容', gambling: '赌博', phishing: '钓鱼欺诈',
     csam: '儿童保护', malware: '恶意软件', copyright: '版权侵权',
@@ -3144,8 +3171,15 @@ async function sendAbuseResolutionEmail(c: any, opts: {
       }),
     }, 8000);
     resendNoteResult(resp.ok);
-  } catch (_) {
+    if (resp.ok) {
+      await persistAbuseEmailResult(c, opts.reportId!, 'sent');
+    } else {
+      const errText = await resp.text().catch(() => `HTTP ${resp.status}`);
+      await persistAbuseEmailResult(c, opts.reportId!, 'failed', `Resend ${resp.status}: ${errText.slice(0, 200)}`);
+    }
+  } catch (e: any) {
     resendNoteResult(false);
+    await persistAbuseEmailResult(c, opts.reportId!, 'failed', e?.message || '网络异常');
   }
 }
 
@@ -3766,43 +3800,55 @@ app.post('/api/admin/abuse/:id/resolve', authMW, async (c) => {
     `UPDATE abuse_reports SET status = ?, resolved_by = ?, resolved_at = datetime('now', '+8 hours'), resolution_note = ? WHERE id = ?`
   ).bind(status, operator, String(note || '').slice(0, 500), reportId).run();
   // 邮件通知举报人复核结果（有邮箱才发）
+  // 投递结果由 sendAbuseResolutionEmail 自己写回 abuse_reports.email_status / email_last_error / email_sent_at
   if (r.reporter_email) {
     const statusLabel: Record<string, string> = { resolved: '已处理（内容已删除/账号已处置）', rejected: '驳回（未发现违规或证据不足）', duplicate: '重复举报（已有相同举报在处理中）' };
     c.executionCtx.waitUntil(sendAbuseResolutionEmail(c, {
+      reportId: r.id,
       toEmail: r.reporter_email,
       category: r.category,
       description: String(r.description || '').slice(0, 200),
       statusLabel: statusLabel[status] || status,
       note: String(note || '').slice(0, 500),
     }));
+  } else {
+    // 匿名举报 / 没邮箱 → 也写一行状态，避免 UI 把 NULL 当"待发送"误显
+    await c.env.DB.prepare(`UPDATE abuse_reports SET email_status = 'no_email' WHERE id = ?`).bind(reportId).run().catch(() => {});
   }
   return c.json({ success: true });
 });
 
-// ══════ 内部：补发举报复核通知邮件 ══════
-app.post('/api/admin/abuse/notify', async (c) => {
+// ══════ Admin: 补发 / 重试举报复核通知邮件 ══════
+// 改鉴权：必须站长身份（之前是匿名公开端点，存在被滥用骚扰举报人邮箱风险）
+// 投递结果会自动写回 abuse_reports.email_status，调用方据此反馈
+app.post('/api/admin/abuse/notify', authMW, async (c) => {
+  if (!isAdmin(c)) return err(c, 'forbidden', '仅平台站长可用', 403);
   const { report_id } = await c.req.json().catch(() => ({}));
   if (!report_id) return c.json({ error: 'missing report_id' }, 400);
   const r = await c.env.DB.prepare(
     `SELECT id, reporter_email, category, description, status, resolution_note FROM abuse_reports WHERE id = ?`
   ).bind(report_id).first() as any;
   if (!r) return c.json({ error: 'not_found' }, 404);
-  if (!r.reporter_email) return c.json({ ok: true, skipped: 'no reporter email' });
+  if (!r.reporter_email) {
+    await c.env.DB.prepare(`UPDATE abuse_reports SET email_status = 'no_email' WHERE id = ?`).bind(report_id).run().catch(() => {});
+    return c.json({ ok: true, skipped: 'no reporter email' });
+  }
   const statusLabel: Record<string, string> = {
     resolved: '已处理（内容已删除/账号已处置）',
     rejected: '驳回（未发现违规或证据不足）',
     duplicate: '重复举报（已有相同举报在处理中）',
   };
   await sendAbuseResolutionEmail(c, {
+    reportId: r.id,
     toEmail: r.reporter_email,
     category: r.category || 'other',
     description: String(r.description || '').slice(0, 200),
     statusLabel: statusLabel[r.status] || r.status,
     note: String(r.resolution_note || '').slice(0, 500),
   });
-  // 标记已发送，避免重复
-  await c.env.DB.prepare(`UPDATE abuse_reports SET email_sent = 1 WHERE id = ?`).bind(report_id).run().catch(() => {});
-  return c.json({ ok: true, to: r.reporter_email });
+  // 回读最新 email_status 让调用方知道这次重试的结果
+  const after = await c.env.DB.prepare(`SELECT email_status, email_sent_at, email_last_error, email_retry_count FROM abuse_reports WHERE id = ?`).bind(report_id).first();
+  return c.json({ ok: true, to: r.reporter_email, ...after });
 });
 
 // ══════ Health ══════
