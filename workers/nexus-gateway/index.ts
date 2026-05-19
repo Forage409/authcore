@@ -3717,17 +3717,17 @@ const _CSP_DIRECTIVES = [
   "default-src 'self'",
   // 'unsafe-inline': Cloudflare Web Analytics 注入的内联 beacon 初始化脚本需要
   // https://static.cloudflareinsights.com: CF Web Analytics beacon.min.js
-  // https://*.alicdn.com / *.aliyun.com: 阿里云 ESA 边缘验证码 SDK
-  "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com https://*.alicdn.com https://*.aliyun.com",
+  // https://*.alicdn.com / *.aliyun.com / *.aliyuncs.com: 阿里云 ESA 边缘验证码 SDK + 设备验证 + captcha-open
+  "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com",
   // Google Fonts 样式表
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "img-src 'self' data: https: blob:",
   // Google Fonts 字体文件
   "font-src 'self' data: https://fonts.gstatic.com",
-  // CF Insights 上报 beacon 数据；阿里云 ESA 验证码调用接口
-  "connect-src 'self' https://*.cloudflareinsights.com https://*.alicdn.com https://*.aliyun.com",
+  // CF Insights 上报 beacon 数据；阿里云 ESA 验证码 xhr 调用 *.aliyuncs.com（cloudauth-device / captcha-open / saf）
+  "connect-src 'self' https://*.cloudflareinsights.com https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com",
   // 阿里云 ESA 验证码会嵌 iframe
-  "frame-src 'self' https://*.alicdn.com https://*.aliyun.com",
+  "frame-src 'self' https://*.alicdn.com https://*.aliyun.com https://*.aliyuncs.com",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",
