@@ -3245,8 +3245,9 @@ app.post('/demo/oauth/authorize/consent', async (c) => {
   const allowed = String(app.redirect_uris || '').split(/[\n,]+/).map((s: string) => s.trim()).filter(Boolean);
   if (!allowed.includes(redirect_uri)) return err(c, 'invalid_redirect_uri', 'redirect_uri 不在白名单', 400);
   // 查 demo 用户（必须是同 tenant 即同一 api_key_id）
+  // playground 演示账号注册在 gateway_users 表，非 users 表（后者无 api_key_id 列）
   const demoUser = await c.env.DB.prepare(
-    `SELECT id, username, password_hash, salt, hash_version FROM users WHERE email = ? AND api_key_id = ?`
+    `SELECT id, username, password_hash, salt, hash_version FROM gateway_users WHERE email = ? AND api_key_id = ?`
   ).bind(email, client_id).first() as any;
   if (!demoUser) return err(c, 'invalid_grant', '账号不存在或不属于此 demo 应用', 400);
   let valid = false;
@@ -3347,9 +3348,9 @@ app.get('/demo/oauth/userinfo', async (c) => {
     if (payload.token_use !== 'access' || !payload.demo) {
       return c.json({ error: 'invalid_token', error_description: '不是 demo access_token' }, 401);
     }
-    // 查 users 表（demo tenant 隔离）
+    // 查 gateway_users 表（playground 演示账号在此表，非 users 表）
     const u = await c.env.DB.prepare(
-      `SELECT id, email, username FROM users WHERE id = ? AND api_key_id = ?`
+      `SELECT id, email, username FROM gateway_users WHERE id = ? AND api_key_id = ?`
     ).bind(payload.sub, payload.aud).first() as any;
     if (!u) return c.json({ error: 'invalid_token', error_description: '演示账号已不存在（24h 后自动清理）' }, 401);
     return c.json({
@@ -3603,7 +3604,7 @@ async function _handleRequest(req: Request, env: Env, ctx: any): Promise<Respons
   const p = url.pathname;
   // 1) API/OIDC 路由 → Hono
   const isOauthApi = p.startsWith('/oauth/') && !(p === '/oauth/authorize' && req.method === 'GET');
-  if (p.startsWith('/api/') || isOauthApi || p === '/.well-known/openid-configuration' || p.startsWith('/avatar/') || p.startsWith('/telemetry/')) {
+  if (p.startsWith('/api/') || p.startsWith('/demo/oauth/') || isOauthApi || p === '/.well-known/openid-configuration' || p.startsWith('/avatar/') || p.startsWith('/telemetry/')) {
     return app.fetch(req, env, ctx);
   }
 
