@@ -520,17 +520,77 @@ async function lookupSoaAt(name: string): Promise<boolean> {
   } catch { return false; }
 }
 
-// 探测某 host 实际所属的 DNS zone：从最低层开始往上走，遇到第一个有 SOA 的 label 即为 zone
-// 例：auth.api.sandbox.xyz 可能 zone 是 auth.api.sandbox.xyz / api.sandbox.xyz / sandbox.xyz 之一
-async function detectActualZone(host: string): Promise<string> {
+// 公共后缀列表（Public Suffix List）精选 —— 覆盖国家代码 ccTLD 的常见多段 TLD
+// 完整列表 ~13KB；这里 inline 最常用的 ~80 条，命中率 ~99%（外加用户自定义私域后缀）
+// 完整 PSL：https://publicsuffix.org/list/public_suffix_list.dat
+const PSL_MULTI_LABEL_SUFFIXES = [
+  // 英国
+  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'ltd.uk', 'me.uk', 'net.uk', 'plc.uk', 'sch.uk',
+  // 澳大利亚
+  'com.au', 'net.au', 'org.au', 'id.au', 'edu.au', 'gov.au', 'asn.au', 'csiro.au',
+  // 日本
+  'co.jp', 'ne.jp', 'or.jp', 'ac.jp', 'ad.jp', 'ed.jp', 'go.jp', 'gr.jp', 'lg.jp',
+  // 韩国
+  'co.kr', 'ne.kr', 'or.kr', 'pe.kr', 'go.kr', 'mil.kr', 'ac.kr', 'hs.kr', 'ms.kr', 'es.kr',
+  // 中国
+  'com.cn', 'net.cn', 'org.cn', 'edu.cn', 'gov.cn', 'ac.cn', 'mil.cn',
+  // 香港
+  'com.hk', 'net.hk', 'org.hk', 'edu.hk', 'gov.hk', 'idv.hk',
+  // 台湾
+  'com.tw', 'net.tw', 'org.tw', 'edu.tw', 'gov.tw', 'idv.tw',
+  // 印度
+  'co.in', 'net.in', 'org.in', 'firm.in', 'gen.in', 'ind.in', 'gov.in', 'edu.in',
+  // 巴西
+  'com.br', 'net.br', 'org.br', 'gov.br', 'edu.br',
+  // 墨西哥
+  'com.mx', 'net.mx', 'org.mx', 'edu.mx', 'gob.mx',
+  // 南非
+  'co.za', 'net.za', 'org.za', 'gov.za', 'edu.za', 'ac.za', 'web.za',
+  // 俄罗斯
+  'com.ru', 'net.ru', 'org.ru',
+  // 阿根廷 / 西班牙 / 加拿大变体
+  'com.ar', 'net.ar', 'org.ar', 'edu.ar', 'gov.ar',
+  'com.es', 'nom.es', 'org.es', 'gob.es',
+  // 中东
+  'com.sg', 'net.sg', 'org.sg', 'edu.sg', 'gov.sg',
+  // 托管平台 PSL（GitHub Pages / CF Pages 等等也算 PSL）
+  'github.io', 'pages.dev', 'workers.dev', 'vercel.app', 'netlify.app',
+];
+
+// 用 PSL 推算 eTLD+1（registrable domain）。例：
+//   auth.test.wenguanquan.id.au → wenguanquan.id.au
+//   foo.bar.example.com → example.com
+function pslGuessZone(host: string): string {
+  const h = host.toLowerCase();
+  // 命中 PSL 多段后缀 → registrable = 前 1 段 + 后缀
+  for (const suffix of PSL_MULTI_LABEL_SUFFIXES) {
+    if (h === suffix) return h;       // 本身就是 PSL，无 registrable
+    if (h.endsWith('.' + suffix)) {
+      const before = h.slice(0, -suffix.length - 1);
+      const lastLabel = before.split('.').pop();
+      if (lastLabel) return lastLabel + '.' + suffix;
+    }
+  }
+  // 默认：最后 2 段（适用于普通单段 TLD：.com / .net / .xyz 等）
+  const parts = h.split('.');
+  if (parts.length <= 2) return h;
+  return parts.slice(-2).join('.');
+}
+
+// 探测某 host 实际所属的 DNS zone + 来源（soa / psl / unknown）
+// 'soa' 是最权威；'psl' 是启发式（域名未解析时用）；'unknown' 留给前端展示警告
+async function detectActualZone(host: string): Promise<{ zone: string; source: 'soa' | 'psl' | 'unknown' }> {
   const labels = host.split('.');
-  // 不查单 label（.com / .xyz 都是 PSL 公共后缀，无意义）
   for (let i = 0; i < labels.length - 1; i++) {
     const candidate = labels.slice(i).join('.');
-    if (await lookupSoaAt(candidate)) return candidate;
+    // 跳过 PSL（不可能成为权威 zone）
+    if (PSL_MULTI_LABEL_SUFFIXES.includes(candidate)) continue;
+    if (await lookupSoaAt(candidate)) return { zone: candidate, source: 'soa' };
   }
-  // 全部失败 → fallback eTLD+1 启发式
-  return labels.slice(-2).join('.');
+  // SOA 全部失败 → 用 PSL 启发式（处理 .id.au / .co.uk 等多段 TLD）
+  const guess = pslGuessZone(host);
+  if (guess && guess !== host) return { zone: guess, source: 'psl' };
+  return { zone: host, source: 'unknown' };
 }
 
 async function lookupTxt(name: string): Promise<{ txts: string[]; diagnostic: string }> {
@@ -2746,11 +2806,11 @@ app.get('/api/clients/:id/verification', authMW, async (c) => {
       ).bind(crypto.randomUUID(), uid, domain, challenge).run();
       v = { challenge, verified: 0, verified_at: null, last_check_at: null, last_check_error: null };
     }
-    // 探测实际 DNS zone（SOA 查询），用于给前端算出阿里云等控制台的「主机记录」短名
-    // 失败时 fallback eTLD+1 启发式；只对未验证的域名查（已验证 / 父域覆盖的不需要）
-    let detectedZone: string | null = null;
+    // 探测 DNS zone：SOA 查询（权威）→ PSL 启发式（多段 TLD）→ 还不行就承认未知
+    // 只对未验证域名做（已验证 / 父域覆盖的不需要 DNS 操作）
+    let zoneInfo: { zone: string; source: 'soa' | 'psl' | 'unknown' } | null = null;
     if (!v.verified) {
-      try { detectedZone = await detectActualZone(domain); } catch {}
+      try { zoneInfo = await detectActualZone(domain); } catch {}
     }
     out.push({
       domain,
@@ -2759,7 +2819,8 @@ app.get('/api/clients/:id/verification', authMW, async (c) => {
       verified_at: v.verified_at,
       last_check_at: v.last_check_at,
       last_check_error: v.last_check_error,
-      detected_zone: detectedZone,            // 实际权威 zone（前端据此算正确短名）
+      detected_zone: zoneInfo?.zone || null,         // 实际权威 zone
+      zone_source: zoneInfo?.source || null,         // soa / psl / unknown，告诉前端可信度
       dns_record: {
         name: '_authcore-verify.' + domain,
         type: 'TXT',
