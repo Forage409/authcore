@@ -48,9 +48,20 @@
     }
 
     // 自动检测 OIDC：若控制台开启了 OIDC，显示一键登录按钮（开发者无需手动接入）
+    // fresh:true 强制穿透前端 60s 缓存 + 后端 SDK 60s 缓存（你在控制台刚开 OIDC 想立刻看到按钮时）
     (async () => {
       try {
-        const cfg = await getConfig();
+        const cfg = await getConfig({ fresh: true });
+        // 诊断输出：开发期排查"开了 OIDC 但按钮不显示"最常见的几种原因
+        if (cfg && cfg.oidc_enabled) {
+          if (!cfg.oidc_default_redirect_uri) {
+            console.warn('[AuthCore] OIDC 已开启但 Redirect URI 未配置——按钮被隐藏。请去控制台编辑该应用，填一个 Redirect URI（如 http://localhost:3000/oidc/callback）后保存。');
+          }
+          if (!cfg.client_id) console.warn('[AuthCore] client_id 缺失，检查后端 /api/config 转发逻辑');
+          if (!cfg.oidc_authorize_url) console.warn('[AuthCore] oidc_authorize_url 缺失（异常情况）');
+        } else if (cfg && !cfg.oidc_enabled) {
+          console.info('[AuthCore] OIDC 未启用。若刚在控制台启用过，请稍等或硬刷新 (Ctrl+F5)。当前配置：', cfg);
+        }
         if (cfg && cfg.oidc_enabled && cfg.oidc_authorize_url && cfg.oidc_default_redirect_uri && cfg.client_id) {
           document.getElementById('oidc-block').style.display = 'block';
           document.getElementById('oidc-btn').addEventListener('click', async () => {

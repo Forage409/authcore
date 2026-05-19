@@ -1,6 +1,6 @@
 {
   "name": "create-nexus-auth",
-  "version": "2.10.1",
+  "version": "2.11.0",
   "description": "AuthCore 脚手架 — 一键创建带登录/注册的认证应用。零外部私有依赖，开箱即用。",
   "main": "bin/create.js",
   "bin": {

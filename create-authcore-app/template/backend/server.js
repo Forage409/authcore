@@ -94,8 +94,14 @@ app.post('/api/user/verify-code', async (req, res) => {
   }
 });
 
-app.get('/api/config', async (_req, res) => {
-  try { res.json(await auth.getConfig()); }
+// /api/config：返回当前应用配置（含 OIDC 开关）。
+// 前端登录页据此决定是否显示「用 AuthCore 一键登录」按钮。
+// 注意两点：
+//   1. 禁用浏览器 / 反代缓存——你在控制台刚开了 OIDC，希望立刻看到按钮，不希望缓存挡 1 分钟
+//   2. 支持 ?fresh=1 强制穿透 SDK 60s 内存缓存（前端首次加载用，方便开发调试）
+app.get('/api/config', async (req, res) => {
+  res.set('Cache-Control', 'no-store, must-revalidate');
+  try { res.json(await auth.getConfig({ noCache: req.query.fresh === '1' })); }
   catch (e) { res.status(400).json({ error: e.message, require_email_verification: false }); }
 });
 

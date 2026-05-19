@@ -133,14 +133,16 @@ if (typeof window !== 'undefined' && !/\/(index\.html)?$|register\.html$/.test(w
   if (getToken()) startSessionWatch(60000);
 }
 
-// ── 应用配置自检（缓存 60 秒） ──
+// ── 应用配置自检（默认 60 秒缓存；getConfig({ fresh: true }) 强制刷新 SDK + 后端缓存） ──
 let _configCache = null;
 let _configCacheAt = 0;
-async function getConfig() {
+async function getConfig(opts) {
+  const fresh = opts && opts.fresh;
   const now = Date.now();
-  if (_configCache && now - _configCacheAt < 60000) return _configCache;
+  if (!fresh && _configCache && now - _configCacheAt < 60000) return _configCache;
   try {
-    const r = await fetch(API_BASE + '/config');
+    // ?fresh=1 让后端跳过 SDK 60s 内存缓存（开发期切换 OIDC 开关需要）
+    const r = await fetch(API_BASE + '/config' + (fresh ? '?fresh=1' : ''), { cache: 'no-store' });
     const d = await r.json();
     _configCache = d;
     _configCacheAt = now;
