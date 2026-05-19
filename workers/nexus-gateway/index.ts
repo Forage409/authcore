@@ -507,6 +507,32 @@ async function lookupTxtFromProvider(url: string): Promise<{ status: number; txt
   } catch { return { status: -2, txts: [] }; }
 }
 
+// DoH 查询 SOA 记录：在 Answer 段返回时即说明此 label 就是 zone apex
+async function lookupSoaAt(name: string): Promise<boolean> {
+  try {
+    const r = await fetchWithTimeout(
+      `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=SOA`,
+      { headers: { 'Accept': 'application/dns-json' } }, 4000
+    );
+    const data: any = await r.json();
+    // Answer 段有 type=6 (SOA) 即说明这个 name 本身就是某个 zone 的 apex
+    return Array.isArray(data?.Answer) && data.Answer.some((a: any) => a.type === 6);
+  } catch { return false; }
+}
+
+// 探测某 host 实际所属的 DNS zone：从最低层开始往上走，遇到第一个有 SOA 的 label 即为 zone
+// 例：auth.api.sandbox.xyz 可能 zone 是 auth.api.sandbox.xyz / api.sandbox.xyz / sandbox.xyz 之一
+async function detectActualZone(host: string): Promise<string> {
+  const labels = host.split('.');
+  // 不查单 label（.com / .xyz 都是 PSL 公共后缀，无意义）
+  for (let i = 0; i < labels.length - 1; i++) {
+    const candidate = labels.slice(i).join('.');
+    if (await lookupSoaAt(candidate)) return candidate;
+  }
+  // 全部失败 → fallback eTLD+1 启发式
+  return labels.slice(-2).join('.');
+}
+
 async function lookupTxt(name: string): Promise<{ txts: string[]; diagnostic: string }> {
   const cf = await lookupTxtFromProvider(
     `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=TXT`
@@ -2720,6 +2746,12 @@ app.get('/api/clients/:id/verification', authMW, async (c) => {
       ).bind(crypto.randomUUID(), uid, domain, challenge).run();
       v = { challenge, verified: 0, verified_at: null, last_check_at: null, last_check_error: null };
     }
+    // 探测实际 DNS zone（SOA 查询），用于给前端算出阿里云等控制台的「主机记录」短名
+    // 失败时 fallback eTLD+1 启发式；只对未验证的域名查（已验证 / 父域覆盖的不需要）
+    let detectedZone: string | null = null;
+    if (!v.verified) {
+      try { detectedZone = await detectActualZone(domain); } catch {}
+    }
     out.push({
       domain,
       verified: !!v.verified,
@@ -2727,6 +2759,7 @@ app.get('/api/clients/:id/verification', authMW, async (c) => {
       verified_at: v.verified_at,
       last_check_at: v.last_check_at,
       last_check_error: v.last_check_error,
+      detected_zone: detectedZone,            // 实际权威 zone（前端据此算正确短名）
       dns_record: {
         name: '_authcore-verify.' + domain,
         type: 'TXT',
