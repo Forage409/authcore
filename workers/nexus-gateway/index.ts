@@ -2090,6 +2090,16 @@ async function upsertOidcIdentity(c: any, email: string, passwordHash: string, s
   }
 }
 
+// Playground 演示账号邮箱模式（playground-<random>@example.com）
+// 这些账号是 SDK /api/auth/register 创建的 tenant-isolated 用户，按设计：
+//   - 只能登录创建它们的那个 demo app（X-API-Key 受限的 /api/auth/login）
+//   - 不能 SSO 进任何 OIDC 应用（包括平台三网与第三方应用）
+//   - 不能登录开发者控制台（gateway_users 表里没行）
+// 通过在 /oauth/authorize/login & /register 早期拦截邮箱模式来强制隔离
+function isPlaygroundDemoEmail(email: string): boolean {
+  return /^playground-[a-z0-9]{6,}@example\.com$/i.test(String(email || ''));
+}
+
 app.post('/oauth/authorize/login', async (c) => {
   const csrf = requireSameOrigin(c); if (csrf) return csrf;
   if (await rateLimit(c, 'oidc_login', 60, 10)) return err(c, 'rate_limited', '请求过于频繁', 429);
@@ -2099,6 +2109,12 @@ app.post('/oauth/authorize/login', async (c) => {
   }
   const { email, password } = await c.req.json().catch(() => ({}));
   if (!email || !password) return err(c, 'missing_fields', '邮箱和密码必填', 400);
+
+  // 演示账号隔离：直接拒绝，不暴露"账号存在"信息
+  if (isPlaygroundDemoEmail(email)) {
+    await bumpLoginFail(c).catch(() => {});
+    return err(c, 'invalid_credentials', '邮箱或密码错误', 401);
+  }
 
   let identityId: string | null = null;
   let migrationSource = '';
@@ -2246,6 +2262,10 @@ app.post('/oauth/authorize/register', async (c) => {
   const { email, password, username, code } = await c.req.json().catch(() => ({}));
   if (!email || !password) return err(c, 'missing_fields', '邮箱和密码必填', 400);
   if (!code) return err(c, 'missing_code', '请先获取并填写邮箱验证码', 400, 'code');
+  // 演示账号邮箱模式专门保留给 Playground SDK 注册流程使用，不允许直接注册到 oidc_identities
+  if (isPlaygroundDemoEmail(email)) {
+    return err(c, 'reserved_email_pattern', '此邮箱模式仅用于 Playground 演示账号，请使用其他邮箱注册', 400, 'email');
+  }
   const pwErr = validatePassword(password);
   if (pwErr) return err(c, pwErr, '密码强度不够', 400, 'password', '至少 8 位含大小写字母与数字');
 
